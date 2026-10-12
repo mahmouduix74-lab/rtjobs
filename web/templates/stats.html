@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}إحصائيات — وظايفي{% endblock %}
+{% block content %}
+<section class="kpis">
+  <div class="kpi"><span>{{ total }}</span>كل الوظايف</div>
+  <div class="kpi"><span>{{ today }}</span>النهارده</div>
+  <div class="kpi"><span>{{ marks.get('saved', 0) }}</span>محفوظة</div>
+  <div class="kpi"><span>{{ marks.get('applied', 0) }}</span>قدّمت عليها</div>
+</section>
+
+<section class="panel">
+  <h2>حالة المواقع (آخر تشغيل)</h2>
+  <table class="runs">
+    <tr><th>الموقع</th><th>الحالة</th><th>وظايف</th><th>إمتى</th></tr>
+    {% for r in runs %}
+    <tr>
+      <td>{{ r.source }}</td>
+      <td><span class="run run-{{ r.status }}" title="{{ r.error or '' }}">{{ r.status }}</span></td>
+      <td>{{ r.jobs_found }}</td>
+      <td>{{ r.ago }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="4">لسه مفيش تشغيل.</td></tr>
+    {% endfor %}
+  </table>
+</section>
+
+<section class="panel">
+  <h2>وظايف جديدة كل يوم (آخر 14 يوم)</h2>
+  <div class="columns">
+    {% for day, n in series %}
+    <div class="col" title="{{ day }}: {{ n }}">
+      <span class="n">{{ n }}</span>
+      <div class="bar" style="height: {{ (n / series_max * 100) | round(1) }}%"></div>
+      <span class="d">{{ day[8:] }}</span>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<div class="two">
+  <section class="panel">
+    <h2>أكتر شركات بتوظّف (30 يوم)</h2>
+    {% set top = companies[0].n if companies else 1 %}
+    {% for c in companies %}
+    <a class="hbar" href="/?q={{ c.company | urlencode }}&days=30">
+      <span class="label" dir="auto">{{ c.company }}</span>
+      <span class="track"><span style="width: {{ (c.n / top * 100) | round(1) }}%"></span></span>
+      <span class="n">{{ c.n }}</span>
+    </a>
+    {% endfor %}
+  </section>
+
+  <section class="panel">
+    <h2>حسب الموقع (30 يوم)</h2>
+    {% set top = by_source[0].n if by_source else 1 %}
+    {% for s in by_source %}
+    <a class="hbar" href="/?source={{ s.source }}&days=30">
+      <span class="label">{{ s.source }}</span>
+      <span class="track"><span style="width: {{ (s.n / top * 100) | round(1) }}%"></span></span>
+      <span class="n">{{ s.n }}</span>
+    </a>
+    {% endfor %}
+    {% if families %}
+    <h2>حسب المجال (30 يوم)</h2>
+    {% set top = families[0][1] %}
+    {% for label, n in families %}
+    <div class="hbar">
+      <span class="label">{{ label }}</span>
+      <span class="track"><span style="width: {{ (n / top * 100) | round(1) }}%"></span></span>
+      <span class="n">{{ n }}</span>
+    </div>
+    {% endfor %}
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

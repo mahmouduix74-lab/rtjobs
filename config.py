@@ -62,7 +62,9 @@ KILL_CHROME_ON_START = os.environ.get("KILL_CHROME_ON_START", "false").lower() =
 # LinkedIn
 # ---------------------------------------------------------------------------
 LINKEDIN_ENABLED = os.environ.get("LINKEDIN_ENABLED", "true").lower() == "true"
-LINKEDIN_SEARCH_URL = (
+# Override with your own search (keywords, filters) via LINKEDIN_SEARCH_URL;
+# the default is every job in Egypt, newest first.
+LINKEDIN_SEARCH_URL = os.environ.get("LINKEDIN_SEARCH_URL") or (
     "https://www.linkedin.com/jobs/search/"
     "?distance=25&geoId=106155005&keywords=&origin=JOB_SEARCH_PAGE_JOB_FILTER"
     "&refresh=true&sortBy=DD"

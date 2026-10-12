@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}وظايفي{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">وظايفي</a>
+    <nav>
+      <a href="/" class="{{ 'on' if request.url.path == '/' }}">الوظايف</a>
+      <a href="/?status=saved">المحفوظة</a>
+      <a href="/?status=applied">قدّمت عليها</a>
+      <a href="/stats" class="{{ 'on' if request.url.path == '/stats' }}">إحصائيات</a>
+    </nav>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  <script src="{{ url_for('static', path='app.js') }}"></script>
+</body>
+</html>
