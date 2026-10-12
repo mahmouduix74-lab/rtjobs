@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block content %}
+<form class="filters" method="get" action="/">
+  <input type="search" name="q" value="{{ f.q }}" placeholder="ابحث: python react">
+  <input type="search" name="x" value="{{ f.x }}" placeholder="استبعد: senior sales">
+  <select name="source">
+    <option value="">كل المواقع</option>
+    {% for s in sources %}<option value="{{ s }}" {{ 'selected' if f.source == s }}>{{ s }}</option>{% endfor %}
+  </select>
+  {% if families %}
+  <select name="family">
+    <option value="">كل المجالات</option>
+    {% for key, label in families.items() %}<option value="{{ key }}" {{ 'selected' if f.family == key }}>{{ label }}</option>{% endfor %}
+  </select>
+  {% endif %}
+  <select name="days">
+    <option value="">أي وقت</option>
+    <option value="1" {{ 'selected' if f.days == '1' }}>آخر 24 ساعة</option>
+    <option value="3" {{ 'selected' if f.days == '3' }}>آخر 3 أيام</option>
+    <option value="7" {{ 'selected' if f.days == '7' }}>آخر أسبوع</option>
+    <option value="30" {{ 'selected' if f.days == '30' }}>آخر شهر</option>
+  </select>
+  <select name="status">
+    <option value="">الكل (من غير المخفية)</option>
+    <option value="new" {{ 'selected' if f.status == 'new' }}>لسه مشفتهاش</option>
+    <option value="saved" {{ 'selected' if f.status == 'saved' }}>المحفوظة ({{ counts.get('saved', 0) }})</option>
+    <option value="applied" {{ 'selected' if f.status == 'applied' }}>قدّمت عليها ({{ counts.get('applied', 0) }})</option>
+    <option value="hidden" {{ 'selected' if f.status == 'hidden' }}>المخفية ({{ counts.get('hidden', 0) }})</option>
+  </select>
+  <button type="submit">بحث</button>
+  {% if query %}<a class="reset" href="/">مسح</a>{% endif %}
+</form>
+
+<div id="new-banner" class="banner" hidden data-latest="{{ latest }}">
+  <a href="">في <span>0</span> وظيفة جديدة — اضغط للتحديث</a>
+</div>
+
+<p class="summary">{{ total }} وظيفة</p>
+
+<ul class="jobs">
+  {% for job in jobs %}
+  <li class="card status-{{ job.status or 'none' }}">
+    <div class="card-main">
+      <a class="title" href="/jobs/{{ job.id }}" dir="auto">{{ job.title or 'بدون عنوان' }}</a>
+      <div class="meta" dir="auto">
+        <span class="company">{{ job.company or '' }}</span>
+        {% if job.location %}<span>· {{ job.location }}</span>{% endif %}
+      </div>
+      <div class="tags">
+        <span class="tag src-{{ job.source }}">{{ job.source }}</span>
+        {% if job.family_label %}<a class="tag" href="/?family={{ job.job_family }}">{{ job.family_label }}</a>{% endif %}
+        {% if job.extra.salary %}<span class="tag">💰 {{ job.extra.salary }}</span>{% endif %}
+        {% if job.extra.workplace %}<span class="tag">{{ job.extra.workplace }}</span>{% endif %}
+        <span class="time" title="{{ job.scraped_at | local_time }}">{{ job.ago }}</span>
+      </div>
+    </div>
+    <div class="card-actions">
+      {% if job.link %}<a class="apply" href="{{ job.link }}" target="_blank" rel="noopener noreferrer">افتح ↗</a>{% endif %}
+      {% include "_marks.html" %}
+    </div>
+  </li>
+  {% else %}
+  <li class="empty">مفيش وظايف بالفلتر ده.</li>
+  {% endfor %}
+</ul>
+
+{% if pages > 1 %}
+<nav class="pager">
+  {% if page > 1 %}<a href="?{{ query | urlencode }}&page={{ page - 1 }}">→ السابق</a>{% endif %}
+  <span>صفحة {{ page }} من {{ pages }}</span>
+  {% if page < pages %}<a href="?{{ query | urlencode }}&page={{ page + 1 }}">التالي ←</a>{% endif %}
+</nav>
+{% endif %}
+{% endblock %}

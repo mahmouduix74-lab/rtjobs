@@ -1,0 +1,80 @@
+# Pull y2youssef/rtjobs into this repo every day (and on demand from the
+# Actions tab). A clean merge is pushed to main; a conflict opens an issue
+# instead, so nothing is ever overwritten silently.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 3 * * *"   # 06:17 Cairo
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM: https://github.com/y2youssef/rtjobs.git
+      UPSTREAM_BRANCH: main
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch upstream "$UPSTREAM_BRANCH"
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
+            echo "Already up to date."
+            echo "result=uptodate" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          new=$(git log --oneline "HEAD..upstream/$UPSTREAM_BRANCH" | wc -l)
+          if git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
+            echo "Merged $new upstream commit(s)."
+            echo "result=merged" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > conflicts.txt
+            git merge --abort
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push
+        if: steps.merge.outputs.result == 'merged'
+        run: git push origin HEAD
+
+      - name: Report conflict
+        if: steps.merge.outputs.result == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Upstream update needs a manual merge"
+          if gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number' | grep -q .; then
+            echo "Issue already open."
+          else
+            {
+              echo "y2youssef/rtjobs has new commits that conflict with this repo's changes."
+              echo
+              echo "Conflicting files:"
+              sed 's/^/- `/; s/$/`/' conflicts.txt
+              echo
+              echo "Resolve locally:"
+              echo '```bash'
+              echo "git remote add upstream $UPSTREAM  # once"
+              echo "git fetch upstream && git merge upstream/$UPSTREAM_BRANCH"
+              echo "# fix the files above, then: git commit && git push"
+              echo '```'
+            } > body.md
+            gh issue create --title "$title" --body-file body.md
+          fi
+          exit 1
