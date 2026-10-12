@@ -44,6 +44,13 @@ DATA_DIR=/tmp/rtjobs-demo TELEGRAM_TOKEN=x TELEGRAM_CHAT_ID=x LOG_FILE= python -
 DATA_DIR=/tmp/rtjobs-demo uvicorn web.app:app --port 8000
 ```
 
+### ديمو على Vercel
+
+`vercel.json` و `api/` بيشغّلوا الواجهة على Vercel بداتا وهمية بس: أول ما السيرفر يصحى بيملا
+160 وظيفة في `/tmp`، وأي حفظ أو ملاحظة بيتمسح لما Vercel يعيد تشغيله. السكرابر نفسه مش بيشتغل هناك.
+في Vercel: Add New → Project → اختار الريبو، وبعدين من Settings → Git خلّي Production Branch هو
+الفرع اللي فيه الملفات دي واعمل Redeploy.
+
 ## خلّي السكرابر يجيب مجالك بس
 
 في `.env`:
