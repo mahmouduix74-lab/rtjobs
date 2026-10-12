@@ -7,10 +7,16 @@ marks / notes are lost with it. The scraper itself can't run on Vercel.
 
 import os
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+# Vercel (AWS Lambda) sets TZ=":UTC", which zoneinfo rejects; show Cairo time
+# like docker-compose does.
+if os.environ.get("TZ", "").startswith(":"):
+    os.environ["TZ"] = "Africa/Cairo"
+    time.tzset()
 os.environ.setdefault("DATA_DIR", "/tmp/rtjobs-demo")
 os.makedirs(os.environ["DATA_DIR"], exist_ok=True)
 
