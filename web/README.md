@@ -1,78 +1,66 @@
-# وظايفي — personal web UI for RTJobs
+# وظايفي — موقع وظايف عام فوق RTJobs
 
-موقع شخصي بيعرض الوظايف اللي السكرابر بيسحبها، من نفس قاعدة البيانات.
+موقع مفتوح لأي حد بيدوّر على شغل، بيعرض الوظايف اللي السكرابر بيلمّها.
 
 - **الوظايف:** بحث بالكلمات، استبعاد كلمات، فلترة بالموقع / المجال / التاريخ.
-- **متابعة:** ★ حفظ · ✓ قدّمت · ✕ إخفاء (ضغطة تانية بتلغي) + ملاحظات لكل وظيفة.
-- **تنبيه في الصفحة:** كل دقيقة بيشوف لو نزلت وظايف جديدة ويظهر شريط "في N وظيفة جديدة".
-- **إحصائيات:** حالة كل موقع في آخر تشغيل، وظايف كل يوم، أكتر الشركات والمجالات.
+- **لكل زائر:** ★ حفظ · ✓ قدّمت · ✕ إخفاء + ملاحظات — محفوظين في متصفحه هو بس
+  (localStorage)، مفيش حسابات ولا بيانات زوار على السيرفر.
+- **تنبيه في الصفحة:** كل دقيقة بيشوف لو نزلت وظايف جديدة.
+- **إحصائيات:** آخر تحديث من كل موقع، وظايف كل يوم، أكتر الشركات والمجالات.
 
-بيقرا جداول السكرابر (`jobs`, `job_enrichments`, `runs`) **قراءة بس**.
-الحفظ والملاحظات بتاعتك في ملف لوحده: `DATA_DIR/web.db`.
+لكل وظيفة بيظهر: العنوان، الشركة، المكان، مقتطف قصير من الوصف، والمهارات، ولينك الإعلان
+الأصلي. الوصف الكامل مش بيتنشر.
 
-## التشغيل مع Docker (على السيرفر)
+## إزاي الأجزاء بتتكلم مع بعض
 
-الـ service اسمها `web` في `docker-compose.override.yaml`، وDocker بيقرا الملف ده
-تلقائياً مع `docker-compose.yaml` (مفصولين علشان تحديثات يوسف تتدمج من غير تعارض).
-
-```bash
-# في .env (اختياري):
-WEB_PASSWORD=كلمة-سر-قوية     # من غيرها الموقع مفتوح لأي حد يوصله
-WEB_PORT=8080
-
-docker compose up -d --build web
+```
+السيرفر (VPS):  scraper ──► rtjobs.db ──► sync (كل دقيقة)
+                                               │
+                                               ▼
+                                    Turso (قاعدة بيانات أونلاين)
+                                               │
+Vercel:                                 الموقع (api/index.py)
 ```
 
-الموقع بيسمع على `127.0.0.1:8080` بس (مش مفتوح للإنترنت). تفتحه بواحدة من دول:
-
-1. **Tailscale (أسهل وأأمن):** نزّل Tailscale على السيرفر والموبايل، وعلى السيرفر:
-   `sudo tailscale serve --bg 8080` → افتح `https://<اسم-السيرفر>.<tailnet>.ts.net` من موبايلك.
-2. **SSH tunnel:** `ssh -L 8080:localhost:8080 user@server` ثم افتح `http://localhost:8080`.
-3. **دومين عام:** reverse proxy زي Caddy قدامه مع HTTPS، ولازم `WEB_PASSWORD`.
-
-## التشغيل محلياً من غير Docker
-
-```bash
-pip install -r web/requirements.txt
-DATA_DIR=. uvicorn web.app:app --port 8000      # DATA_DIR = الفولدر اللي فيه rtjobs.db
-```
-
-### تجربة بداتا وهمية
-
-```bash
-DATA_DIR=/tmp/rtjobs-demo TELEGRAM_TOKEN=x TELEGRAM_CHAT_ID=x LOG_FILE= python -m web.demo_seed
-DATA_DIR=/tmp/rtjobs-demo uvicorn web.app:app --port 8000
-```
-
-### ديمو على Vercel
-
-`vercel.json` و `api/` بيشغّلوا الواجهة على Vercel بداتا وهمية بس: أول ما السيرفر يصحى بيملا
-160 وظيفة في `/tmp`، وأي حفظ أو ملاحظة بيتمسح لما Vercel يعيد تشغيله. السكرابر نفسه مش بيشتغل هناك.
-في Vercel: Add New → Project → اختار الريبو، وبعدين من Settings → Git خلّي Production Branch هو
-الفرع اللي فيه الملفات دي واعمل Redeploy.
-
-## خلّي السكرابر يجيب مجالك بس
-
-في `.env`:
-
-```dotenv
-# LinkedIn: اعمل البحث على الموقع بالفلاتر اللي عايزها، رتّب بـ Most recent، وانسخ الرابط
-LINKEDIN_SEARCH_URL=https://www.linkedin.com/jobs/search/?keywords=python%20developer&geoId=106155005&sortBy=DD
-# Wuzzuf: نفس الفكرة (خلي start=0)
-WUZZUF_SEARCH_URL=https://wuzzuf.net/search/jobs?q=python%20developer&start=0
-```
-
-وبعدين `docker compose up -d scraper`.
+- `web/sync.py` بيقرا `rtjobs.db` **قراءة بس** وبيبعت الوظايف الجديدة والتصنيفات اللي
+  اتأخرت وآخر حالة لكل موقع لجداول `public_jobs` / `public_runs` في Turso. بيمسح من
+  Turso أي وظيفة أقدم من `PUBLIC_RETENTION_DAYS` (45 يوم).
+- `web/app.py` بيقرا الجداول دي بس (`web/store.py`: Turso عن طريق HTTP، أو ملف SQLite محلي).
+- Vercel بيخزّن كل صفحة دقيقة (`s-maxage=60`)، فالزيارات الكتير مش بتضغط على Turso.
 
 ## الإعدادات
 
+**على السيرفر** (في `.env` جنب `docker-compose.yaml`):
+
+```dotenv
+TURSO_DATABASE_URL=libsql://<اسم-القاعدة>-<اسمك>.turso.io
+TURSO_AUTH_TOKEN=<التوكن>
+LINKEDIN_ENABLED=false          # LinkedIn ممنوع يتنشر منه؛ سيبه مقفول في النسخة العامة
+```
+
+وبعدين: `docker compose up -d --build sync`
+
+**على Vercel** (Project → Settings → Environment Variables): نفس
+`TURSO_DATABASE_URL` و `TURSO_AUTH_TOKEN`، وبعدين Redeploy. من غيرهم الموقع بيشتغل ديمو
+بـ 160 وظيفة وهمية.
+
 | متغير | الافتراضي | |
 |---|---|---|
-| `DATA_DIR` | `.` | فولدر `rtjobs.db` و `web.db` |
-| `WEB_PASSWORD` | فاضي | لو موجود: الموقع يطلب كلمة سر (أي اسم مستخدم) |
-| `WEB_PORT` | `8080` | البورت على السيرفر (compose) |
-| `WEB_TAXONOMY` | `markup/enrichment/taxonomy.json` | أسماء المجالات |
+| `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN` | فاضي | قاعدة Turso (السيرفر + Vercel) |
+| `PUBLIC_DB` | `DATA_DIR/public.db` | ملف SQLite محلي لو مفيش Turso |
+| `PUBLIC_RETENTION_DAYS` | `45` | الوظايف الأقدم من كده بتتشال من الموقع |
+| `SYNC_INTERVAL_SECONDS` | `60` | كل قد إيه `sync` يبعت الجديد |
+| `WEB_PASSWORD` | فاضي | لو موجود: الموقع كله يطلب كلمة سر (ومفيش كاش) |
 | `TZ` | `Africa/Cairo` | التوقيت في العرض |
+
+## تجربة محلياً بداتا وهمية
+
+```bash
+pip install -r web/requirements.txt
+DATA_DIR=/tmp/rtjobs-demo TELEGRAM_TOKEN=x TELEGRAM_CHAT_ID=x LOG_FILE= python -m web.demo_seed
+DATA_DIR=/tmp/rtjobs-demo python -m web.sync --once
+DATA_DIR=/tmp/rtjobs-demo uvicorn web.app:app --port 8000
+```
 
 ## تحديثات يوسف (y2youssef/rtjobs)
 
@@ -82,7 +70,7 @@ WUZZUF_SEARCH_URL=https://wuzzuf.net/search/jobs?q=python%20developer&start=0
 - لو فيه commits جديدة ومفيش تعارض → بيدمجها في `main` لوحده.
 - لو فيه تعارض مع تعديلاتنا → مش بيلمس حاجة، وبيفتح issue فيه أسماء الملفات وخطوات الحل.
 
-على السيرفر بعد كل تحديث: `git pull` ثم `scripts/deploy.sh` (أو `docker compose up -d --build`).
+على السيرفر بعد كل تحديث: `git pull` ثم `docker compose up -d --build`.
 
 تعديلاتنا على ملفات يوسف قليلة عمداً: سطرين في `config.py` (`LINKEDIN_SEARCH_URL`)،
-والباقي كله ملفات جديدة (`web/`، `docker-compose.override.yaml`، الـ workflow).
+والباقي كله ملفات جديدة (`web/`، `api/`، `vercel.json`، `docker-compose.override.yaml`، الـ workflow).

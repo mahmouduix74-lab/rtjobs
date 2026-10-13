@@ -187,3 +187,7 @@ main { max-width: 980px; margin: 0 auto; padding: 16px; }
   .card-actions { flex-direction: row; align-items: center; justify-content: space-between; width: 100%; }
   .filters select { flex: 1 1 45%; }
 }
+.hint { color: var(--muted); font-size: 13px; margin: -6px 0 10px; }
+.source-note { color: var(--muted); font-size: 14px; }
+.source-note a { font-weight: 600; }
+.note label small { color: var(--muted); font-weight: normal; }

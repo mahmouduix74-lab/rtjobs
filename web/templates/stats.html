@@ -4,18 +4,18 @@
 <section class="kpis">
   <div class="kpi"><span>{{ total }}</span>كل الوظايف</div>
   <div class="kpi"><span>{{ today }}</span>النهارده</div>
-  <div class="kpi"><span>{{ marks.get('saved', 0) }}</span>محفوظة</div>
-  <div class="kpi"><span>{{ marks.get('applied', 0) }}</span>قدّمت عليها</div>
+  <div class="kpi"><span data-count="saved">0</span>محفوظة عندك</div>
+  <div class="kpi"><span data-count="applied">0</span>قدّمت عليها</div>
 </section>
 
 <section class="panel">
-  <h2>حالة المواقع (آخر تشغيل)</h2>
+  <h2>آخر تحديث من كل موقع</h2>
   <table class="runs">
     <tr><th>الموقع</th><th>الحالة</th><th>وظايف</th><th>إمتى</th></tr>
     {% for r in runs %}
     <tr>
       <td>{{ r.source }}</td>
-      <td><span class="run run-{{ r.status }}" title="{{ r.error or '' }}">{{ r.status }}</span></td>
+      <td><span class="run run-{{ r.status }}">{{ r.status }}</span></td>
       <td>{{ r.jobs_found }}</td>
       <td>{{ r.ago }}</td>
     </tr>
