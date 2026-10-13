@@ -22,11 +22,11 @@
   </select>
   <select name="status">
     <option value="">الكل (من غير المخفية)</option>
-    <option value="new" {{ 'selected' if f.status == 'new' }}>لسه مشفتهاش</option>
-    <option value="saved" {{ 'selected' if f.status == 'saved' }}>المحفوظة ({{ counts.get('saved', 0) }})</option>
-    <option value="applied" {{ 'selected' if f.status == 'applied' }}>قدّمت عليها ({{ counts.get('applied', 0) }})</option>
-    <option value="hidden" {{ 'selected' if f.status == 'hidden' }}>المخفية ({{ counts.get('hidden', 0) }})</option>
+    <option value="saved" data-count="saved" data-label="المحفوظة" {{ 'selected' if f.status == 'saved' }}>المحفوظة</option>
+    <option value="applied" data-count="applied" data-label="قدّمت عليها" {{ 'selected' if f.status == 'applied' }}>قدّمت عليها</option>
+    <option value="hidden" data-count="hidden" data-label="المخفية" {{ 'selected' if f.status == 'hidden' }}>المخفية</option>
   </select>
+  <input type="hidden" name="ids" value="{{ f.ids }}">
   <button type="submit">بحث</button>
   {% if query %}<a class="reset" href="/">مسح</a>{% endif %}
 </form>
@@ -36,10 +36,11 @@
 </div>
 
 <p class="summary">{{ total }} وظيفة</p>
+{% if f.status %}<p class="hint">العلامات دي محفوظة على الجهاز ده بس.</p>{% endif %}
 
 <ul class="jobs">
   {% for job in jobs %}
-  <li class="card status-{{ job.status or 'none' }}">
+  <li class="card status-none" data-job="{{ job.id }}">
     <div class="card-main">
       <a class="title" href="/jobs/{{ job.id }}" dir="auto">{{ job.title or 'بدون عنوان' }}</a>
       <div class="meta" dir="auto">
@@ -49,8 +50,7 @@
       <div class="tags">
         <span class="tag src-{{ job.source }}">{{ job.source }}</span>
         {% if job.family_label %}<a class="tag" href="/?family={{ job.job_family }}">{{ job.family_label }}</a>{% endif %}
-        {% if job.extra.salary %}<span class="tag">💰 {{ job.extra.salary }}</span>{% endif %}
-        {% if job.extra.workplace %}<span class="tag">{{ job.extra.workplace }}</span>{% endif %}
+        {% for tag in job.tags[:2] %}<span class="tag" dir="auto">{{ tag }}</span>{% endfor %}
         <span class="time" title="{{ job.scraped_at | local_time }}">{{ job.ago }}</span>
       </div>
     </div>
@@ -60,7 +60,7 @@
     </div>
   </li>
   {% else %}
-  <li class="empty">مفيش وظايف بالفلتر ده.</li>
+  <li class="empty">{% if f.status and not f.ids %}لسه معلّمتش أي وظيفة هنا من الجهاز ده.{% else %}مفيش وظايف بالفلتر ده.{% endif %}</li>
   {% endfor %}
 </ul>
 

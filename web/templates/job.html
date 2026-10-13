@@ -10,15 +10,13 @@
   </p>
   <div class="tags">
     <span class="tag src-{{ job.source }}">{{ job.source }}</span>
-    {% if job.family_label %}<span class="tag">{{ job.family_label }}</span>{% endif %}
+    {% if job.family_label %}<a class="tag" href="/?family={{ job.job_family }}">{{ job.family_label }}</a>{% endif %}
     {% if job.specialization %}<span class="tag">{{ job.specialization }}</span>{% endif %}
-    {% for key in ('salary', 'workplace', 'career_level', 'job_type') %}
-      {% if job.extra[key] and job.extra[key] is string %}<span class="tag">{{ job.extra[key] }}</span>{% endif %}
-    {% endfor %}
+    {% for tag in job.tags %}<span class="tag" dir="auto">{{ tag }}</span>{% endfor %}
   </div>
   <p class="times">
     {% if job.posted_at %}نُشرت: {{ job.posted_at[:16] }} · {% endif %}
-    اتسحبت: {{ job.scraped_at | local_time }} ({{ job.ago }})
+    اتضافت: {{ job.scraped_at | local_time }} ({{ job.ago }})
   </p>
 
   <div class="job-actions">
@@ -26,24 +24,23 @@
     {% include "_marks.html" %}
   </div>
 
-  {% if job.enrichment and job.enrichment is mapping %}
+  {% if job.skills %}
   <section class="enrich">
-    {% for key, label in [('tools', 'الأدوات'), ('certifications', 'الشهادات'), ('languages', 'اللغات')] %}
-      {% set items = job.enrichment.get(key) %}
-      {% if items and items is iterable and items is not string %}
-      <p><strong>{{ label }}:</strong>
-        {% for it in items %}<span class="tag" dir="auto">{{ it if it is string else (it.get('name') if it is mapping else it) }}</span>{% endfor %}
-      </p>
-      {% endif %}
-    {% endfor %}
+    <p><strong>المهارات المطلوبة:</strong>
+      {% for it in job.skills %}<span class="tag" dir="auto">{{ it }}</span>{% endfor %}
+    </p>
   </section>
   {% endif %}
 
-  <section class="description" dir="auto">{{ job.description or 'مفيش وصف محفوظ.' }}</section>
+  <section class="description" dir="auto">{{ job.excerpt or 'مفيش وصف.' }}</section>
+  {% if job.link %}
+  <p class="source-note">ده جزء من الإعلان بس.
+    <a href="{{ job.link }}" target="_blank" rel="noopener noreferrer">اقرا الإعلان كامل على {{ job.source }} ↗</a></p>
+  {% endif %}
 
   <section class="note">
-    <label for="note">ملاحظاتي</label>
-    <textarea id="note" data-job="{{ job.id }}" rows="4" placeholder="مثلاً: كلمت HR يوم ...">{{ job.note or '' }}</textarea>
+    <label for="note">ملاحظاتي <small>(بتتحفظ على الجهاز ده بس)</small></label>
+    <textarea id="note" data-job="{{ job.id }}" rows="4" placeholder="مثلاً: كلمت HR يوم ..."></textarea>
     <small class="saved-hint" hidden>اتحفظت ✓</small>
   </section>
 </article>

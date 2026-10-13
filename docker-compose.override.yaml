@@ -3,24 +3,32 @@
 # docker-compose.yaml (`docker compose up -d` picks up both).
 
 services:
-  web:
-    # Personal web UI over the same SQLite DB (reads the scraper's tables only;
-    # its own saved/applied/notes go to /data/web.db). See web/README.md.
+  scraper:
+    build:
+      # Chrome base built on THIS machine (scripts/setup_server.sh writes
+      # CHROME_BASE=rtjobs-chrome-base:<version> to .env). Google only serves
+      # the current Chrome, so a new server can't build the version the
+      # Dockerfile pins; unset, the Dockerfile's pin is used.
+      args:
+        - CHROME_BASE
+
+  sync:
+    # Publishes new jobs (title, company, short excerpt, link) to the public
+    # site's Turso database every minute. Reads the scraper's DB read-only.
+    # See web/README.md.
     build:
       context: .
       dockerfile: web/Dockerfile
     image: rtjobs-web
-    container_name: rtjobs-web
+    container_name: rtjobs-sync
     init: true
+    command: ["python", "-m", "web.sync"]
     environment:
       - TZ=${TZ:-Africa/Cairo}
       - DATA_DIR=/data
-      - WEB_TAXONOMY=/data/markup/enrichment/taxonomy.json
-      - WEB_PASSWORD=${WEB_PASSWORD:-}
+      - TURSO_DATABASE_URL=${TURSO_DATABASE_URL:-}
+      - TURSO_AUTH_TOKEN=${TURSO_AUTH_TOKEN:-}
+      - PUBLIC_RETENTION_DAYS=${PUBLIC_RETENTION_DAYS:-45}
     volumes:
       - scraper_data:/data
-      - ./markup:/data/markup:ro
-    # Loopback only: reach it through Tailscale / an SSH tunnel / a reverse proxy.
-    ports:
-      - "127.0.0.1:${WEB_PORT:-8080}:8000"
     restart: unless-stopped

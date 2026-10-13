@@ -1,11 +1,11 @@
-"""Personal web UI over the scraper's SQLite database.
+"""Public job board over the jobs web/sync.py publishes.
 
-Reads `jobs` / `job_enrichments` / `runs` from rtjobs.db and never writes to
-it. Personal state (saved / applied / hidden, notes) lives in a separate
-web.db attached to each connection, so the scraper's schema and its
-rollbacks are untouched.
+Reads only the `public_jobs` / `public_runs` tables in the store (a local
+SQLite file or Turso, see web/store.py), so it runs anywhere, including
+Vercel. Visitors' saved / applied / hidden marks and notes live in their own
+browser (localStorage); the server keeps no per-user state.
 
-Run:  DATA_DIR=/data uvicorn web.app:app --host 127.0.0.1 --port 8000
+Run:  PUBLIC_DB=/data/public.db uvicorn web.app:app --host 127.0.0.1 --port 8000
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import json
 import os
 import secrets
 import sqlite3
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -24,17 +23,18 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
 
-DATA_DIR = os.environ.get("DATA_DIR", ".")
-DB_PATH = os.environ.get("WEB_JOBS_DB", os.path.join(DATA_DIR, "rtjobs.db"))
-WEB_DB_PATH = os.environ.get("WEB_DB", os.path.join(DATA_DIR, "web.db"))
+from web.store import StoreError, open_store
+
 PASSWORD = os.environ.get("WEB_PASSWORD", "")
 LOCAL_TZ = ZoneInfo(os.environ.get("TZ") or "Africa/Cairo")
 PAGE_SIZE = 40
+MAX_IDS = 300
 STATUSES = ("saved", "applied", "hidden")
 SOURCES = ("linkedin", "wuzzuf", "indeed", "naukrigulf")
 TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+# Lets Vercel's CDN answer repeat visits for a minute instead of the database.
+CACHE = "public, max-age=0, s-maxage=60, stale-while-revalidate=300"
 
 HERE = Path(__file__).parent
 TAXONOMY_PATH = Path(os.environ.get(
@@ -49,31 +49,14 @@ def _load_families() -> dict[str, str]:
 
 
 FAMILIES = _load_families()
-
-_WEB_SCHEMA = """
-CREATE TABLE IF NOT EXISTS w.marks (
-    job_id     INTEGER PRIMARY KEY,
-    status     TEXT,
-    note       TEXT NOT NULL DEFAULT '',
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS w.idx_marks_status ON marks(status);
-"""
+store = open_store()
 
 
-@contextmanager
-def db():
-    if not os.path.exists(DB_PATH):
-        raise HTTPException(503, f"قاعدة البيانات مش موجودة: {DB_PATH}")
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
+def query(sql: str, args=()) -> list[dict]:
     try:
-        conn.execute("ATTACH DATABASE ? AS w", (WEB_DB_PATH,))
-        conn.executescript(_WEB_SCHEMA)
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+        return store.query(sql, args)
+    except (StoreError, OSError, sqlite3.Error) as exc:
+        raise HTTPException(503, "قاعدة البيانات مش متاحة دلوقتي، جرّب كمان شوية") from exc
 
 
 def utcnow() -> datetime:
@@ -115,25 +98,18 @@ def local_time(value: str | None) -> str:
     return ts.replace(tzinfo=timezone.utc).astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
 
 
-def location(extra: dict) -> str:
-    for key in ("location", "detail_location", "city"):
-        if isinstance(extra.get(key), str) and extra[key].strip():
-            return extra[key].strip()
-    return ""
-
-
-def decode_extra(raw: str | None) -> dict:
+def _json_list(raw: str | None) -> list:
     try:
-        value = json.loads(raw) if raw else {}
+        value = json.loads(raw) if raw else []
     except ValueError:
-        return {}
-    return value if isinstance(value, dict) else {}
+        return []
+    return value if isinstance(value, list) else []
 
 
-def job_view(row: sqlite3.Row) -> dict:
+def job_view(row: dict) -> dict:
     job = dict(row)
-    job["extra"] = decode_extra(job.get("extra"))
-    job["location"] = location(job["extra"])
+    job["tags"] = _json_list(job.get("tags"))
+    job["skills"] = _json_list(job.get("skills"))
     job["family_label"] = FAMILIES.get(job.get("job_family") or "", "")
     job["ago"] = ago(job.get("scraped_at"))
     return job
@@ -148,7 +124,7 @@ templates.env.globals.update(families=FAMILIES, sources=SOURCES)
 
 @app.middleware("http")
 async def basic_auth(request: Request, call_next):
-    """Optional single-user password (WEB_PASSWORD); any username works."""
+    """Optional site-wide password (WEB_PASSWORD); unset = public."""
     if PASSWORD:
         header = request.headers.get("authorization", "")
         supplied = ""
@@ -159,127 +135,89 @@ async def basic_auth(request: Request, call_next):
                 supplied = ""
         if not secrets.compare_digest(supplied.encode(), PASSWORD.encode()):
             return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="RTJobs"'})
-    return await call_next(request)
+    response = await call_next(request)
+    if not PASSWORD and request.method == "GET" and response.status_code == 200 \
+            and "cache-control" not in response.headers:
+        response.headers["Cache-Control"] = CACHE
+    return response
+
+
+def _ids(raw: str) -> list[int]:
+    ids = []
+    for part in raw.split(","):
+        if part.strip().isdigit():
+            ids.append(int(part))
+    return list(dict.fromkeys(ids))[:MAX_IDS]
 
 
 def _filters(params) -> tuple[str, list, dict]:
     """WHERE clause + args for the list page, and the normalized filter values."""
     f = {
-        "q": params.get("q", "").strip(),
-        "x": params.get("x", "").strip(),
+        "q": params.get("q", "").strip()[:200],
+        "x": params.get("x", "").strip()[:200],
         "source": params.get("source", "") if params.get("source") in SOURCES else "",
         "family": params.get("family", "") if params.get("family") in FAMILIES else "",
-        "status": params.get("status", ""),
-        "days": params.get("days", ""),
+        "status": params.get("status", "") if params.get("status") in STATUSES else "",
+        "days": params.get("days", "") if params.get("days") in ("1", "3", "7", "30") else "",
+        "ids": "",
     }
     where, args = ["1=1"], []
-    for word in f["q"].split():
-        where.append("(j.title LIKE ? OR j.company LIKE ? OR j.description LIKE ?)")
+    for word in f["q"].split()[:8]:
+        where.append("(title LIKE ? OR company LIKE ? OR excerpt LIKE ?)")
         args += [f"%{word}%"] * 3
-    for word in f["x"].split():
-        where.append("NOT (COALESCE(j.title,'') LIKE ? OR COALESCE(j.company,'') LIKE ?)")
+    for word in f["x"].split()[:8]:
+        where.append("NOT (COALESCE(title,'') LIKE ? OR COALESCE(company,'') LIKE ?)")
         args += [f"%{word}%"] * 2
     if f["source"]:
-        where.append("j.source = ?")
+        where.append("source = ?")
         args.append(f["source"])
     if f["family"]:
-        where.append("e.job_family = ?")
+        where.append("job_family = ?")
         args.append(f["family"])
-    if f["status"] in STATUSES:
-        where.append("m.status = ?")
-        args.append(f["status"])
-    elif f["status"] == "new":
-        where.append("m.status IS NULL")
-    else:
-        f["status"] = ""
-        where.append("COALESCE(m.status, '') != 'hidden'")
-    if f["days"] in ("1", "3", "7", "30"):
-        where.append("j.scraped_at >= ?")
+    if f["days"]:
+        where.append("scraped_at >= ?")
         args.append((utcnow() - timedelta(days=int(f["days"]))).strftime(TS_FORMAT))
-    else:
-        f["days"] = ""
+    if f["status"]:
+        # The visitor's own marks, sent by app.js from localStorage.
+        ids = _ids(params.get("ids", ""))
+        f["ids"] = ",".join(map(str, ids))
+        where.append(f"id IN ({','.join('?' * len(ids))})" if ids else "0")
+        args += ids
     return " AND ".join(where), args, f
-
-
-_JOIN = """
-FROM jobs j
-LEFT JOIN job_enrichments e ON e.job_id = j.id AND e.state = 'ready'
-LEFT JOIN w.marks m ON m.job_id = j.id
-"""
 
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, page: int = 1):
     where, args, f = _filters(request.query_params)
     page = max(page, 1)
-    with db() as conn:
-        total = conn.execute(f"SELECT COUNT(*) {_JOIN} WHERE {where}", args).fetchone()[0]
-        rows = conn.execute(
-            f"SELECT j.id, j.source, j.title, j.company, j.posted_at, j.scraped_at, j.link,"
-            f" j.extra, e.job_family, e.specialization, m.status {_JOIN}"
-            f" WHERE {where} ORDER BY j.id DESC LIMIT ? OFFSET ?",
-            args + [PAGE_SIZE, (page - 1) * PAGE_SIZE]).fetchall()
-        latest = conn.execute("SELECT COALESCE(MAX(id), 0) FROM jobs").fetchone()[0]
-        counts = dict(conn.execute(
-            "SELECT status, COUNT(*) FROM w.marks WHERE status IS NOT NULL GROUP BY status").fetchall())
-    query = {k: v for k, v in f.items() if v}
+    total = query(f"SELECT COUNT(*) n FROM public_jobs WHERE {where}", args)[0]["n"]
+    rows = query(
+        f"SELECT id, source, title, company, location, posted_at, scraped_at, link, tags,"
+        f" job_family FROM public_jobs WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+        args + [PAGE_SIZE, (page - 1) * PAGE_SIZE])
+    latest = query("SELECT COALESCE(MAX(id), 0) n FROM public_jobs")[0]["n"]
+    params = {k: v for k, v in f.items() if v}
     return templates.TemplateResponse(request, "index.html", {
         "jobs": [job_view(r) for r in rows], "f": f, "total": total, "page": page,
-        "pages": max(1, -(-total // PAGE_SIZE)), "latest": latest, "counts": counts,
-        "query": query,
+        "pages": max(1, -(-total // PAGE_SIZE)), "latest": latest, "query": params,
     })
 
 
 @app.get("/jobs/{job_id}", response_class=HTMLResponse)
 def job_detail(request: Request, job_id: int):
-    with db() as conn:
-        row = conn.execute(
-            f"SELECT j.*, e.job_family, e.specialization, e.employer_sector, e.result_json,"
-            f" m.status, m.note {_JOIN} WHERE j.id = ?", (job_id,)).fetchone()
-    if row is None:
-        raise HTTPException(404, "الوظيفة مش موجودة")
-    job = job_view(row)
-    try:
-        job["enrichment"] = json.loads(job.get("result_json") or "{}")
-    except ValueError:
-        job["enrichment"] = {}
-    return templates.TemplateResponse(request, "job.html", {"job": job})
-
-
-class Mark(BaseModel):
-    status: str | None = None
-    note: str | None = None
-
-
-@app.post("/api/jobs/{job_id}/mark")
-def mark(job_id: int, body: Mark):
-    if body.status is not None and body.status not in STATUSES + ("",):
-        raise HTTPException(400, "status غلط")
-    with db() as conn:
-        if conn.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone() is None:
-            raise HTTPException(404, "الوظيفة مش موجودة")
-        current = conn.execute("SELECT status, note FROM w.marks WHERE job_id = ?", (job_id,)).fetchone()
-        status = current["status"] if current else None
-        note = current["note"] if current else ""
-        if body.status is not None:
-            status = body.status or None
-        if body.note is not None:
-            note = body.note[:5000]
-        conn.execute(
-            "INSERT INTO w.marks(job_id, status, note, updated_at) VALUES (?,?,?,?)"
-            " ON CONFLICT(job_id) DO UPDATE SET status=excluded.status, note=excluded.note,"
-            " updated_at=excluded.updated_at",
-            (job_id, status, note, utcnow().strftime(TS_FORMAT)))
-    return {"job_id": job_id, "status": status, "note": note}
+    rows = query("SELECT * FROM public_jobs WHERE id = ?", (job_id,))
+    if not rows:
+        raise HTTPException(404, "الوظيفة مش موجودة أو اتشالت")
+    return templates.TemplateResponse(request, "job.html", {"job": job_view(rows[0])})
 
 
 @app.get("/api/latest")
 def latest(since: int = 0):
     """Newest job id and how many arrived after `since` (the list page polls this)."""
-    with db() as conn:
-        top, new = conn.execute(
-            "SELECT COALESCE(MAX(id), 0), COUNT(*) FILTER (WHERE id > ?) FROM jobs", (since,)).fetchone()
-    return JSONResponse({"latest": top, "new": new})
+    row = query("SELECT COALESCE(MAX(id), 0) top, COALESCE(SUM(CASE WHEN id > ? THEN 1 ELSE 0 END), 0) new"
+                " FROM public_jobs", (since,))[0]
+    return JSONResponse({"latest": row["top"], "new": row["new"]},
+                        headers={"Cache-Control": "public, max-age=0, s-maxage=30"})
 
 
 @app.get("/stats", response_class=HTMLResponse)
@@ -287,31 +225,22 @@ def stats(request: Request):
     now = utcnow()
     since_14 = (now - timedelta(days=14)).strftime(TS_FORMAT)
     since_30 = (now - timedelta(days=30)).strftime(TS_FORMAT)
-    with db() as conn:
-        total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-        today_start = datetime.now(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-        today = conn.execute("SELECT COUNT(*) FROM jobs WHERE scraped_at >= ?", (
-            today_start.astimezone(timezone.utc).strftime(TS_FORMAT),)).fetchone()[0]
-        per_day = {}
-        for row in conn.execute("SELECT scraped_at FROM jobs WHERE scraped_at >= ?", (since_14,)):
-            day = local_time(row[0])[:10]
-            per_day[day] = per_day.get(day, 0) + 1
-        by_source = conn.execute(
-            "SELECT source, COUNT(*) n FROM jobs WHERE scraped_at >= ? GROUP BY source ORDER BY n DESC",
-            (since_30,)).fetchall()
-        companies = conn.execute(
-            "SELECT company, COUNT(*) n FROM jobs WHERE scraped_at >= ? AND COALESCE(company,'') != ''"
-            " GROUP BY company ORDER BY n DESC LIMIT 15", (since_30,)).fetchall()
-        families = conn.execute(
-            "SELECT e.job_family, COUNT(*) n FROM jobs j JOIN job_enrichments e ON e.job_id = j.id"
-            " WHERE e.state = 'ready' AND j.scraped_at >= ? GROUP BY e.job_family ORDER BY n DESC",
-            (since_30,)).fetchall()
-        runs = conn.execute(
-            "SELECT r.source, r.status, r.jobs_found, r.error, r.started_at, r.finished_at FROM runs r"
-            " JOIN (SELECT source, MAX(id) id FROM runs GROUP BY source) last ON last.id = r.id"
-            " ORDER BY r.source").fetchall()
-        marks = dict(conn.execute(
-            "SELECT status, COUNT(*) FROM w.marks WHERE status IS NOT NULL GROUP BY status").fetchall())
+    today_start = datetime.now(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    total = query("SELECT COUNT(*) n FROM public_jobs")[0]["n"]
+    today = query("SELECT COUNT(*) n FROM public_jobs WHERE scraped_at >= ?", (
+        today_start.astimezone(timezone.utc).strftime(TS_FORMAT),))[0]["n"]
+    per_day = {}
+    for row in query("SELECT scraped_at FROM public_jobs WHERE scraped_at >= ?", (since_14,)):
+        day = local_time(row["scraped_at"])[:10]
+        per_day[day] = per_day.get(day, 0) + 1
+    by_source = query("SELECT source, COUNT(*) n FROM public_jobs WHERE scraped_at >= ?"
+                      " GROUP BY source ORDER BY n DESC", (since_30,))
+    companies = query("SELECT company, COUNT(*) n FROM public_jobs WHERE scraped_at >= ?"
+                      " AND COALESCE(company,'') != '' GROUP BY company ORDER BY n DESC LIMIT 15",
+                      (since_30,))
+    families = query("SELECT job_family, COUNT(*) n FROM public_jobs WHERE scraped_at >= ?"
+                     " AND job_family IS NOT NULL GROUP BY job_family ORDER BY n DESC", (since_30,))
+    runs = query("SELECT source, status, jobs_found, finished_at FROM public_runs ORDER BY source")
     days = [(now - timedelta(days=i)).replace(tzinfo=timezone.utc).astimezone(LOCAL_TZ).strftime("%Y-%m-%d")
             for i in range(13, -1, -1)]
     series = [(d, per_day.get(d, 0)) for d in days]
@@ -319,7 +248,6 @@ def stats(request: Request):
         "total": total, "today": today, "series": series,
         "series_max": max([n for _, n in series] + [1]),
         "by_source": by_source, "companies": companies,
-        "families": [(FAMILIES.get(r[0], r[0]), r[1]) for r in families],
-        "runs": [dict(r) | {"ago": ago(r["finished_at"] or r["started_at"])} for r in runs],
-        "marks": marks,
+        "families": [(FAMILIES.get(r["job_family"], r["job_family"]), r["n"]) for r in families],
+        "runs": [r | {"ago": ago(r["finished_at"])} for r in runs],
     })
