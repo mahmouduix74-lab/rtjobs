@@ -30,18 +30,20 @@ Vercel:                                 الموقع (api/index.py)
 
 ## الإعدادات
 
-**على السيرفر** (في `.env` جنب `docker-compose.yaml`):
+**على السيرفر** (Ubuntu): `sudo bash scripts/setup_server.sh` — بيسطّب Docker، يسألك على
+التوكنات ويكتبها في `.env` (root بس يقدر يقراه)، يبني صورة Chrome للسيرفر ده، ويشغّل
+السكرابر + `sync`. بيقفل LinkedIn (شروطه بتمنع إعادة النشر) ويشغّل Wuzzuf. القيم اللي بيكتبها:
 
 ```dotenv
 TURSO_DATABASE_URL=libsql://<اسم-القاعدة>-<اسمك>.turso.io
-TURSO_AUTH_TOKEN=<التوكن>
-LINKEDIN_ENABLED=false          # LinkedIn ممنوع يتنشر منه؛ سيبه مقفول في النسخة العامة
+TURSO_AUTH_TOKEN=<توكن Read & Write>
+TELEGRAM_TOKEN=...  TELEGRAM_CHAT_ID=@قناة-الوظايف  TELEGRAM_FAILURE_CHAT_ID=<رقمك>
+LINKEDIN_ENABLED=false
+CHROME_BASE=rtjobs-chrome-base:<نسخة Chrome اللي اتبنت هنا>
 ```
 
-وبعدين: `docker compose up -d --build sync`
-
-**على Vercel** (Project → Settings → Environment Variables): نفس
-`TURSO_DATABASE_URL` و `TURSO_AUTH_TOKEN`، وبعدين Redeploy. من غيرهم الموقع بيشتغل ديمو
+**على Vercel** (Project → Settings → Environment Variables): `TURSO_DATABASE_URL` نفسه،
+و `TURSO_AUTH_TOKEN` = توكن **Read Only** (الموقع بيقرا بس)، وبعدين Redeploy. من غيرهم الموقع بيشتغل ديمو
 بـ 160 وظيفة وهمية.
 
 | متغير | الافتراضي | |

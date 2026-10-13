@@ -3,6 +3,15 @@
 # docker-compose.yaml (`docker compose up -d` picks up both).
 
 services:
+  scraper:
+    build:
+      # Chrome base built on THIS machine (scripts/setup_server.sh writes
+      # CHROME_BASE=rtjobs-chrome-base:<version> to .env). Google only serves
+      # the current Chrome, so a new server can't build the version the
+      # Dockerfile pins; unset, the Dockerfile's pin is used.
+      args:
+        - CHROME_BASE
+
   sync:
     # Publishes new jobs (title, company, short excerpt, link) to the public
     # site's Turso database every minute. Reads the scraper's DB read-only.
