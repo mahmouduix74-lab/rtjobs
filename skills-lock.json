@@ -1,6 +1,12 @@
 {
   "version": 1,
   "skills": {
+    "graphic-case-study": {
+      "source": "varnan-tech/opendirectory",
+      "sourceType": "github",
+      "skillPath": "skills/graphic-case-study/SKILL.md",
+      "computedHash": "633eb9cb8590a891625d4f25c46ca3598fbc37ba52fb765e8ce83357865d0d83"
+    },
     "portfolio-case-study-writer": {
       "source": "paramchoudhary/resumeskills",
       "sourceType": "github",
