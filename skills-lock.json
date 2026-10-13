@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "portfolio-case-study-writer": {
+      "source": "paramchoudhary/resumeskills",
+      "sourceType": "github",
+      "skillPath": "skills/portfolio-case-study-writer/SKILL.md",
+      "computedHash": "06712b3c7b6699797d15009ae31eca1e5b582290695f759a25a0bd9759312375"
+    }
+  }
+}
