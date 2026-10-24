@@ -362,3 +362,19 @@ indeed/linkedin/wuzzuf ok/ok, naukrigulf degraded/ok (`ERR_NETWORK_CHANGED` at
 the switch, as at the last three). Image
 `rtjobs-scraper:production-4b43f80-20261024-1503`; rollback target
 `rtjobs-scraper:rollback-20261024-1503` (= 0b8347a). Schema unchanged.
+
+## 2026-10-24 15:35 Cairo: LinkedIn window diagnostics (`65113da`)
+
+`reliability/linkedin-window-diagnostics` (`f24cc21`): the window_complete
+detail and the `job_list` latency row carry the cards each page served and the
+IDs repeated from an earlier page (`served`, `repeated`), to tell shifting pages
+from a job LinkedIn counts but does not list (13:03-14:57 gaps, see AGENTS
+backlog). No extra requests. First rows: `served [25, 25, 3], repeated 0`.
+
+`scripts/deploy.sh` (15:33:01-15:36:13): gate 46 checks, scrapling contract ok,
+Chrome 151.0.7922.108; switched 15:35:10; verified, naukrigulf degraded/ok
+(`ERR_NETWORK_CHANGED` at the switch). That was NaukriGulf's 4th switch failure
+within an hour (14:52, 14:54, 15:05, 15:35): one `search_fetch` alert, deployed
+before 16:06 on the user's call. Image
+`rtjobs-scraper:production-65113da-20261024-1533`; rollback target
+`rtjobs-scraper:rollback-20261024-1533` (= 4b43f80). Schema unchanged.

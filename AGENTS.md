@@ -504,7 +504,7 @@ port and logins disabled — never the production profile directly.
   missed. Logs could not tell a repeat across pages from a hidden job; branch
   `reliability/linkedin-window-diagnostics` adds per-page card counts and repeated
   IDs (no extra request) to the window_complete detail and the `job_list` latency
-  row (`served`, `repeated`). Repeats = pages shift (fix: overlapping pages); none and
+  row (`served`, `repeated`), live 2026-10-24 15:35. Repeats = pages shift (fix: overlapping pages); none and
   served < total = LinkedIn counts a job it does not list (needs another query).
 - Host Chrome (154) vs container Chrome (151): the hosted DevTools frontend can
   mismatch; use the URL printed by scripts/inspect_chrome.py.
@@ -619,6 +619,9 @@ port and logins disabled — never the production profile directly.
   monitor scrape_result confirm rule, classifier routing rules (prompt
   `471001db34d1b320`, live from 14:57: see the rollback note in Deploy gate).
   First attempt rolled back on a pre-existing LinkedIn window_complete gap.
+- 2026-10-24 15:35 Cairo: main `65113da` deployed (image
+  `production-65113da-20261024-1533`, rollback `rollback-20261024-1533` = 4b43f80):
+  LinkedIn window diagnostics (`served`/`repeated` per window).
 
 ## Immediate queue notifications
 - After committing a complete scrape cycle, notify `enrichment`; after committing
