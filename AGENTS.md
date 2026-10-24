@@ -15,7 +15,9 @@ live debugging / manual 2FA solves.
 source .venv/bin/activate.fish      # shell is fish; venv is Python 3.14
 python main.py                      # run all enabled boards
 python main.py --reset-login        # clear LinkedIn retry/cooldown state
-python -m py_compile <files...>     # no linter/typechecker configured — compile check + offline tests are the verification loop
+python -m py_compile <files...>     # compile check; with ruff + the offline tests this is the verification loop
+.venv/bin/ruff check .              # lint for bugs (ruff.toml; pyflakes + bugbear, not style); deploy.sh runs it first
+.venv/bin/pip install -r requirements-dev.txt  # dev tools (ruff), never in the image
 scripts/deploy.sh                   # THE way to deploy main: gate in the candidate image, quiet-moment switch, auto-rollback
 scripts/deploy.sh --dry-run         # build + gate only (any branch); production untouched
 scripts/build_chrome_base.sh        # (re)build the pinned Chrome base image; --upgrade fetches a new Chrome on purpose

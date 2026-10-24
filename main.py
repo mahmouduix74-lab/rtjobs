@@ -275,7 +275,7 @@ def _run_one_board(board_cls) -> tuple[int, bool]:
         logger.exception("Board '%s' crashed: %s", board.name, e)
         report_run_checks(board.name, {"board_run": (False, f"Board '{board.name}' crashed: {e}"[:600])})
         if _shutting_down:
-            raise SystemExit(0)
+            raise SystemExit(0) from None
         return 0, True
 
 

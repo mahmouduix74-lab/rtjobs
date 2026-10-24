@@ -1,0 +1,2 @@
+# Development tools only (not installed in the image): .venv/bin/pip install -r requirements-dev.txt
+ruff==0.17.2
