@@ -94,11 +94,3 @@ def setup_logging() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     _configured = True
-
-
-def get_log_file() -> str | None:
-    """Return the active log file path, or None if file logging is disabled."""
-    data_dir = os.environ.get("DATA_DIR", ".")
-    default_log = os.path.join(data_dir, "logs", "rtjobs.log")
-    path = os.environ.get("LOG_FILE", default_log).strip()
-    return path or None

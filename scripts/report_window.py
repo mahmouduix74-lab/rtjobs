@@ -18,7 +18,7 @@ import argparse
 import os
 import sqlite3
 import statistics
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 PAGE = {"linkedin": 25, "wuzzuf": 15, "indeed": 15, "naukrigulf": 30}
 GOOD = ("ok", "degraded")

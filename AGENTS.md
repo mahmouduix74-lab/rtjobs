@@ -350,8 +350,9 @@ Set dummy env before importing config in test scripts:
   cycle first if it has no current result). Latency reports exclude reposts.
 - Company blocklist: `markup/blocked_companies.json` (bind-mounted, so
   live-editable without rebuild). Keyed by source + `"*"` for all sources;
-  case-insensitive substring match (`core/blocklist.py`). Blocked jobs are
-  `db.mark_seen`'d (never re-scraped) but never saved/notified.
+  case-insensitive substring match (`core/blocklist.py`). Blocked jobs go into
+  `seen_ids` (`db.save_jobs(accepted, blocked)`: never re-scraped) but are never
+  saved/notified.
 - Snapshots via `markup.save_snapshot(site, kind, html)` on every
   suspicious page (login failure, checkpoint, empty results, redirects).
 - Failures -> `telegram.notify_failure(subject, detail, snapshot, hint)`;
