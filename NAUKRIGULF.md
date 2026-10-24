@@ -69,7 +69,7 @@ jobId), `posted_date` (latestPostedDate readable), plus the shared job fields.
   but three switches within an hour reach FLAP_FAILURES: 2026-10-24 14:52,
   14:54 and 15:05 (deploy, rollback, deploy) sent one `search_fetch` alert.
   Host network changes cause the same error outside deploys (Oct 22-23 nights).
-  Fixed on branch `reliability/naukrigulf-network-retry`: a navigation aborted by
+  Fixed (`a89c078`, live 2026-10-24 16:44): a navigation aborted by
   `ERR_NETWORK_CHANGED` gets ONE more visit after 3 s (`boards/naukrigulf/scraper.scrape`,
   fresh spider on the same Chrome); every other failure keeps the one-visit rule.
   A failed navigation now names its error in `search_fetch` (was "completed

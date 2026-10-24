@@ -391,3 +391,21 @@ Also deleted from the checkout (all git-ignored, unused by production, which
 mounts named volumes): `chromeprofile/` and `wuzzufprofile/` (pre-Docker
 profiles, Sep 4), `artifacts/` (Oct 4 pre-deploy DB copy + staging),
 `exports/jobs.json` (Sep 25 dump). `jobnetworkminiapp/` stays (user).
+
+## 2026-10-24 16:44 Cairo: LinkedIn count-ahead, NaukriGulf network retry, cleanup + ruff (`a89c078`)
+
+- `reliability/linkedin-count-ahead` (`8827a67`): a list that ended with no
+  repeats and at most 3 short of `paging.total` is LinkedIn counting jobs it
+  does not list yet: one relevance-order page looks for them and the window
+  counts as complete (no alert). Live at once: 64 of 65 and 65 of 66 ok,
+  probe served 25, found none.
+- `reliability/naukrigulf-network-retry` (`9047240`): one more visit after
+  `ERR_NETWORK_CHANGED` only. This switch did not hit the error (first run
+  ok), so the retry is verified offline only so far.
+- Also first deployed here: dead-code cleanup and ruff (`8c2d5b6`; no runtime
+  change). deploy.sh's new lint step ran clean.
+
+`scripts/deploy.sh` (16:39:58-16:45:26): gate 46 checks, scrapling contract
+ok, Chrome 151.0.7922.108; switched 16:44:32; verified all four boards ok/ok.
+Image `rtjobs-scraper:production-a89c078-20261024-1639`; rollback target
+`rtjobs-scraper:rollback-20261024-1639` (= 65113da). Schema unchanged.

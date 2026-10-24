@@ -518,7 +518,7 @@ port and logins disabled — never the production profile directly.
   ANSWER (15:42-15:45, first gap after the deploy): `served [25,25,4,0]` /
   `[25,25,5,0]`, 0 repeated, total one higher = LinkedIn counts a job it does not
   list. Our paging cannot reach it; finding it needs a second query (another sort).
-  DONE on branch `reliability/linkedin-count-ahead` (Gotchas #13a): such gaps no longer
+  DONE (`a89c078`, live 2026-10-24 16:44; Gotchas #13a): such gaps no longer
   alert, and one relevance-order page looks for the job. Check its `probe` field in the
   job_list latency rows: `found` non-empty = jobs the date order hid, now saved.
 - Host Chrome (154) vs container Chrome (151): the hosted DevTools frontend can
@@ -639,6 +639,10 @@ port and logins disabled — never the production profile directly.
   LinkedIn window diagnostics (`served`/`repeated` per window).
 - 2026-10-24 15:50: images older than c7a706b deleted (oldest rollback target now
   `rollback-20261024-1033` = c7a706b); see docs/DEPLOYMENT.md.
+- 2026-10-24 16:44 Cairo: main `a89c078` deployed (image
+  `production-a89c078-20261024-1639`, rollback `rollback-20261024-1639` = 65113da):
+  LinkedIn count-ahead (no alert for <= 3 short, relevance probe), NaukriGulf
+  ERR_NETWORK_CHANGED retry, dead-code cleanup, ruff in deploy.sh.
 
 ## Immediate queue notifications
 - After committing a complete scrape cycle, notify `enrichment`; after committing
