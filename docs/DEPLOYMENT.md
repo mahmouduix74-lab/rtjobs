@@ -378,3 +378,16 @@ within an hour (14:52, 14:54, 15:05, 15:35): one `search_fetch` alert, deployed
 before 16:06 on the user's call. Image
 `rtjobs-scraper:production-65113da-20261024-1533`; rollback target
 `rtjobs-scraper:rollback-20261024-1533` (= 4b43f80). Schema unchanged.
+
+## 2026-10-24 15:50 Cairo: old images and local leftovers removed
+
+Kept: `production-65113da-20261024-1533` (live), rollback targets
+`rollback-20261024-1533` (= 4b43f80), `rollback-20261024-1503` (= 0b8347a),
+`rollback-20261024-1033` (= c7a706b), `rtjobs-chrome-base:151.0.7922.108` and
+its `python:3.13-slim` base. Every older RTJobs image (Oct 3-10; none can read
+LinkedIn's AI search page) was deleted, so the rollback tags named in the
+records above, older than c7a706b, no longer exist. Images 14.3 GB -> 2.1 GB.
+Also deleted from the checkout (all git-ignored, unused by production, which
+mounts named volumes): `chromeprofile/` and `wuzzufprofile/` (pre-Docker
+profiles, Sep 4), `artifacts/` (Oct 4 pre-deploy DB copy + staging),
+`exports/jobs.json` (Sep 25 dump). `jobnetworkminiapp/` stays (user).

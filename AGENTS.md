@@ -625,6 +625,8 @@ port and logins disabled — never the production profile directly.
 - 2026-10-24 15:35 Cairo: main `65113da` deployed (image
   `production-65113da-20261024-1533`, rollback `rollback-20261024-1533` = 4b43f80):
   LinkedIn window diagnostics (`served`/`repeated` per window).
+- 2026-10-24 15:50: images older than c7a706b deleted (oldest rollback target now
+  `rollback-20261024-1033` = c7a706b); see docs/DEPLOYMENT.md.
 
 ## Immediate queue notifications
 - After committing a complete scrape cycle, notify `enrichment`; after committing
