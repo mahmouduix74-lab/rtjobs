@@ -301,3 +301,26 @@ checks, no monitor alerts. Image `rtjobs-scraper:production-c7a706b-20261024-081
 rollback target `rtjobs-scraper:rollback-20261024-0810` (= cf7db61; its LinkedIn
 code cannot read the AI page, so set `LINKEDIN_ENABLED=False` when rolling back).
 Schema unchanged (monitor reminders reuse `pipeline_alerts.last_alert_at`).
+
+## 2026-10-24 10:35 Cairo: code-review fixes + Indeed Turnstile cap (`0b8347a`)
+
+Three branches from the code review triage, each tested on its own, then merged
+(the merged tree was identical to the tested `integration/2026-10-24` run):
+- `reliability/budget-file-atomic` (`ab6fbec`): the time-budget state file is
+  replaced in one step; a torn read at the end of a person wait could make the
+  parent kill the board right after the solve (review F3).
+- `reliability/reservation-release` (`d06910f`): a classifier reservation is
+  released whenever the provider provably did not bill (nothing sent, or an
+  HTTP error status); timeouts and 2xx answers keep it (review F1).
+- `latency/indeed-turnstile-cap` (`00b51f8`): the Cloudflare solver's post-click
+  network-idle wait is capped at 10s (was the 120s page default: 321 of 361
+  Indeed solves Oct 14-24 took 115-125s and held the cycle).
+Also on main: Mindrift blocked on every board (`4d3ab97`, live via the bind
+mount since 10:10, before this deploy).
+
+`scripts/deploy.sh` (10:33:32-10:36:10): gate 46 checks, scrapling contract ok,
+Chrome 151.0.7922.108; switched 10:35:38; verified indeed/linkedin/wuzzuf ok/ok,
+naukrigulf degraded/ok (first run `ERR_NETWORK_CHANGED` during the container
+switch, as at the last two switches; next run ok, no alert). Image
+`rtjobs-scraper:production-0b8347a-20261024-1033`; rollback target
+`rtjobs-scraper:rollback-20261024-1033` (= c7a706b). Schema unchanged.

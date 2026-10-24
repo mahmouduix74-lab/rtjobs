@@ -581,6 +581,10 @@ port and logins disabled — never the production profile directly.
   `production-c7a706b-20261024-0810`, rollback `rollback-20261024-0810` = cf7db61,
   whose LinkedIn cannot read the AI page: set LINKEDIN_ENABLED=False with it):
   person-wait + LinkedIn API window + monitor reminders. See docs/DEPLOYMENT.md.
+- 2026-10-24 10:35 Cairo: main `0b8347a` deployed (image
+  `production-0b8347a-20261024-1033`, rollback `rollback-20261024-1033` = c7a706b):
+  atomic budget file (F3), reservation release rule (F1), Indeed Turnstile
+  post-click cap, Mindrift blocked. See docs/DEPLOYMENT.md.
 
 ## Immediate queue notifications
 - After committing a complete scrape cycle, notify `enrichment`; after committing
