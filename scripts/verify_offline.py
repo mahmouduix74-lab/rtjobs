@@ -508,7 +508,7 @@ def verify(directory):
     with ExitStack() as stack:
         stack.enter_context(patch.object(li_board.login_state, "is_blocked", return_value=False))
         stack.enter_context(patch.object(li_board.login_state, "should_wipe_profile", return_value=False))
-        for module, cls in ((li_board, li_board.LinkedInBoard), (wu_board, wu_board.WuzzufBoard), (in_board, in_board.IndeedBoard)):
+        for _module, cls in ((li_board, li_board.LinkedInBoard), (wu_board, wu_board.WuzzufBoard), (in_board, in_board.IndeedBoard)):
             with patch.object(board_base, "chrome_session", side_effect=RuntimeError("startup failed")):
                 try:
                     cls().run()
@@ -613,10 +613,11 @@ def verify(directory):
         stack.enter_context(patch.object(li_board.login_state, "should_wipe_profile", return_value=False))
         for module, cls in ((li_board, li_board.LinkedInBoard), (wu_board, wu_board.WuzzufBoard), (in_board, in_board.IndeedBoard)):
             for healthy in (False, True):
+                # Called within this iteration, so the loop variables are current.
                 def fake_scrape(selectors, cdp_url, health, on_job=None):
                     health.check("search_fetch", True)
-                    health.check("search_structure", healthy, "Simulated incomplete page")
-                    items = [dict(base, source=cls.name, external_id="status-test-" + str(healthy))]
+                    health.check("search_structure", healthy, "Simulated incomplete page")  # noqa: B023
+                    items = [dict(base, source=cls.name, external_id="status-test-" + str(healthy))]  # noqa: B023
                     return {"items": items, "listings": {}, "login_redirect": False, "logged_out": False, "blocked": False}
                 with ExitStack() as case:
                     case.enter_context(patch.object(board_base, "chrome_session", side_effect=lambda *a, **kw: nullcontext("unused")))
@@ -742,7 +743,6 @@ def verify_reposts():
 
 def verify_browser_launch():
     """CDP origin allow-list, sandbox switch, busy port, group stop, crash stderr."""
-    import signal as signals
     import socket
     import tempfile as tmp
     from core import browser
@@ -1025,7 +1025,7 @@ def verify_person_wait():
                 first = len(_calls) == 1
                 return SimpleNamespace(status="ok", error=""), {
                     "items": [], "listings": {}, "blocked": False, "login_redirect": False,
-                    "logged_out": False, "needs_login": False, "signed_in": not first, flag: first}
+                    "logged_out": False, "needs_login": False, "signed_in": not first, flag: first}  # noqa: B023 (same iteration)
             def login_check(cdp, _waits=waits):
                 if _waits:
                     with board_budget.paused():
@@ -1702,7 +1702,6 @@ def verify_direct_search():
 
 
 def verify_browser_recovery():
-    from datetime import datetime
     from boards.linkedin import scraper as li
     from boards.indeed import scraper as indeed
     from boards.base import load_board_selectors

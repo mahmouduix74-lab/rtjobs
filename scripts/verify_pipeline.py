@@ -156,7 +156,7 @@ def main():
             assert len(offline_jobs) == 4
             with db.get_db() as conn:
                 before = conn.execute('SELECT amount FROM enrichment_spend').fetchone()[0]
-            for attempt in range(3):
+            for _ in range(3):
                 db.set_pipeline_state('classifier', {})
                 with patch.object(client, 'request_bound', return_value=.5), \
                      patch.object(client.session, 'post', side_effect=requests.ConnectionError('dropped keep-alive')), \
