@@ -222,7 +222,9 @@ login check, 403/429 stop further calls for the run. LinkedIn checks:
 `listing_times`, `card_ids`, `detail_fetch`, `detail_content` and the job fields.
 An incomplete window (`window_complete`) reports the cards each page served and
 the IDs repeated from an earlier page, telling shifting pages from a job
-LinkedIn counts but does not list.
+LinkedIn counts but does not list. A list that ended up to 3 short with no
+repeats is the latter (LinkedIn counts new jobs minutes before listing them): one
+page in relevance order looks for the missing jobs, and it does not alert.
 Alerts retain transport codes and HTTP errors without request URLs, query
 strings, cookies or bodies. These checks cannot always identify whether the
 local network or the remote server caused a connection failure.

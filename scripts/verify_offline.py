@@ -1803,10 +1803,26 @@ def verify_browser_recovery():
         assert not spider.health.checks["window_complete"]["good"] and len(page.calls) == 3
         assert "29 of the 30" in spider.health.error and "pages served 25+5+0 cards, 1 repeated from an earlier page" \
             f" ({ids[24]})" in spider.health.error, spider.health.error
-        page = LinkedInApiPage([(200, cards_body(ids[:25], total=30)), (200, cards_body(ids[25:29], total=30)),
+        # No repeats, list ended, up to 3 short: LinkedIn counts jobs it does not
+        # list yet. One relevance-order page looks for them; never an alert.
+        short = [(200, cards_body(ids[:25], total=30)), (200, cards_body(ids[25:29], total=30)), (200, cards_body([], total=30))]
+        page = LinkedInApiPage(short + [(200, cards_body(ids[:25], total=30))])
+        spider, saved = await run(page, known=ids)
+        assert spider.health.status == "ok" and spider.health.checks["window_complete"]["good"], spider.health.error
+        assert len(page.calls) == 4 and "sortBy:List(DD)" in page.calls[0] and "sortBy:List(R)" in page.calls[3] \
+            and "start=0" in page.calls[3] and not saved
+        page = LinkedInApiPage(short + [(200, cards_body([ids[29]] + ids[:10], total=30))], {ids[29]: (200, posting(ids[29]))})
+        spider, saved = await run(page, known=ids[:29])
+        assert spider.health.status == "ok" and [job["external_id"] for job in saved] == [ids[29]], spider.health.error
+        page = LinkedInApiPage(short + [(429, "")])
+        spider, saved = await run(page, known=ids)
+        assert spider.health.status == "ok" and len(page.calls) == 4 and not saved, spider.health.error
+        # One past the limit, or a repeat (above), is ours to explain: no probe, alert.
+        page = LinkedInApiPage([(200, cards_body(ids[:25], total=30)), (200, cards_body(ids[25:26], total=30)),
                                 (200, cards_body([], total=30))])
         spider, _ = await run(page, known=ids)
-        assert "pages served 25+4+0 cards, 0 repeated from an earlier page." in spider.health.error, spider.health.error
+        assert not spider.health.checks["window_complete"]["good"] and len(page.calls) == 3
+        assert "26 of the 30" in spider.health.error and "pages served 25+1+0 cards, 0 repeated" in spider.health.error
         odd = cards_body(ids[:2])
         odd["data"]["elements"].append({"jobCardUnion": {"*jobPostingCard": "urn:li:fsd_promotedCard:1"}})
         spider, _ = await run(LinkedInApiPage([(200, odd)]), known=ids)
