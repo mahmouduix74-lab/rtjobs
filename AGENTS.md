@@ -484,6 +484,14 @@ port and logins disabled — never the production profile directly.
 - DECIDED (user, 2026-10-24): no catch-up of the LinkedIn jobs missed during the
   Oct 21-24 outage; accepted loss.
 - Retention for latency_events / runs / scrape_batches / enrichment_requests.
+- Monitor `scrape_result_<board>` (core/pipeline_monitor.py) alerts on ONE degraded
+  run whenever the monitor polls before the next run completes, bypassing the
+  confirm-twice rule of the board checks: 2026-10-24 10:51 LinkedIn sent "latest
+  completed scrape was degraded" for window_complete 27 of 28 (LinkedIn's total ran
+  ahead of its pages), healed by the 10:54 run with nothing lost; NaukriGulf's
+  degraded run at the deploy switch stayed silent only because it healed in 23s.
+  Fix: failing only when the last TWO completed runs are not ok. User: noted, not
+  yet (2026-10-24).
 - Host Chrome (154) vs container Chrome (151): the hosted DevTools frontend can
   mismatch; use the URL printed by scripts/inspect_chrome.py.
 
