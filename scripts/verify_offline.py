@@ -1579,7 +1579,41 @@ def verify_cloudflare_fast_path():
     except RuntimeError:
         pass
     assert "networkidle" in page.calls, "unreadable page: let the real solver decide"
-    print("PASS Cloudflare fast path: solver only for real challenges (two looks), retries untouched")
+    # Through the real solver's click path: its untimed post-click idle wait
+    # (the page default: 120s on Indeed) is capped; the 5s one is unchanged.
+    from core.browser import _CF_CLICK_IDLE_MS
+    class ClickPage(SyncPage):
+        """A managed challenge that clears once the checkbox is clicked."""
+        def __init__(self):
+            super().__init__([challenge])
+            self.mouse, self.idle = self, []
+        def content(self): return clean if "click" in self.calls else challenge
+        def click(self, x, y, **_kw): self.calls.append("click")
+        def frame(self, url=None): return None
+        def locator(self, _selector): return SimpleNamespace(last=SimpleNamespace(bounding_box=lambda: {"x": 0, "y": 0}))
+    class AsyncClickPage(ClickPage):
+        async def content(self): return ClickPage.content(self)
+        async def wait_for_timeout(self, ms): self.calls.append(("timeout", ms))
+        async def click(self, x, y, **_kw): self.calls.append("click")
+        def locator(self, _selector):
+            async def box(): return {"x": 0, "y": 0}
+            return SimpleNamespace(last=SimpleNamespace(bounding_box=box))
+    def click_session(asynchronous=False):
+        if asynchronous:
+            async def idle(page, timeout=None): page.idle.append(timeout)
+            async def stable(*_args): pass
+        else:
+            def idle(page, timeout=None): page.idle.append(timeout)
+            def stable(*_args): pass
+        return SimpleNamespace(_detect_cloudflare=StealthySession._detect_cloudflare, _wait_for_networkidle=idle,
+                               _challenge_cleared=StealthySession._challenge_cleared, _wait_for_page_stability=stable)
+    page = ClickPage()
+    assert StealthySession._cloudflare_solver(click_session(), page) is None and "click" in page.calls
+    assert page.idle == [5000, _CF_CLICK_IDLE_MS], page.idle
+    page = AsyncClickPage()
+    assert asyncio.run(AsyncStealthySession._cloudflare_solver(click_session(True), page)) is None
+    assert "click" in page.calls and page.idle == [5000, _CF_CLICK_IDLE_MS], page.idle
+    print("PASS Cloudflare fast path: solver only for real challenges (two looks), retries untouched, post-click idle wait capped")
 
 
 def verify_direct_search():

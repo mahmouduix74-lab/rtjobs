@@ -423,6 +423,13 @@ port and logins disabled — never the production profile directly.
   networkidle BEFORE looking for a challenge on every solve_cloudflare fetch;
   now two looks (0s, 1s) with the solver's own detector, the real solver only
   for a challenge or unreadable page.
+- (2026-10-24, branch `latency/indeed-turnstile-cap`) After clicking the
+  Turnstile box the solver waited for networkidle with NO timeout = the page
+  default (Indeed: 120s); Indeed never goes idle, so 321 of 361 Indeed solves
+  Oct 14-24 took 115-125s and held the whole cycle. The real solver now runs
+  against `core.browser._SolverView`, which caps that wait at
+  `_CF_CLICK_IDLE_MS` (10s); the solver's own 10s clear-poll and retry follow
+  unchanged. Same bug in scrapling 0.5 (upstream #524): keep the cap there.
 - (Superseded 2026-10-24 by the API window, Gotchas #13:) LinkedIn scrolled
   once to start the list load and read listing times from the page's own
   job-cards API response. Indeed polls for its jobcards blob instead of a
