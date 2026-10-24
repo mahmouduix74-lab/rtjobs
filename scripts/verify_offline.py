@@ -14,6 +14,7 @@ import subprocess
 import sys
 import signal
 import tempfile
+import threading
 import time
 from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
@@ -27,6 +28,50 @@ class SignedInContext:
     """Fake browser context holding a LinkedIn session cookie (li_at)."""
     async def cookies(self, url=None):
         return [{"name": "li_at", "value": "offline"}]
+
+
+class LinkedInApiPage:
+    """Fake signed-in LinkedIn page answering the spider's in-page API fetches.
+
+    `cards` answers job-list calls in order (the last answer repeats);
+    `postings` maps job id -> answer (or a list, answered in order; missing =
+    404). An answer is (status, body[, final_url]) or an exception to raise
+    (e.g. the page navigated mid-call). Every requested URL lands in `calls`.
+    """
+    url = "https://www.linkedin.com/jobs/search-results/?keywords=jobs"
+
+    def __init__(self, cards, postings=None, cookies=None):
+        self.cards, self.postings, self.calls = list(cards), dict(postings or {}), []
+        jar = cookies if cookies is not None else [{"name": "li_at", "value": "offline"},
+                                                    {"name": "JSESSIONID", "value": '"ajax:0000"'}]
+        self.context = SimpleNamespace(cookies=AsyncMock(return_value=jar))
+
+    async def evaluate(self, script, args):
+        url = args[0]
+        self.calls.append(url)
+        if "voyagerJobsDashJobCards" in url:
+            answer = self.cards.pop(0) if len(self.cards) > 1 else self.cards[0]
+        else:
+            answer = self.postings.get(url.split("/jobPostings/")[1].split("?")[0], (404, None))
+            if isinstance(answer, list):
+                answer = answer.pop(0) if len(answer) > 1 else answer[0]
+        if isinstance(answer, Exception):
+            raise answer
+        status, body, final = (*answer, url) if len(answer) == 2 else answer
+        return {"status": status, "url": final, "body": body if isinstance(body, str) else json.dumps(body)}
+
+
+def linkedin_fixture(name: str, **times) -> dict:
+    """A synthetic LinkedIn API response (markup/linkedin/api_<name>_sample.json)
+    with its "LISTED_1"-style placeholders replaced by epoch milliseconds."""
+    text = (ROOT / f"markup/linkedin/api_{name}_sample.json").read_text()
+    for key, value in times.items():
+        text = text.replace(f'"{key.upper()}"', str(int(value)))
+    return json.loads(text)
+
+
+def minutes_ago_ms(minutes: float) -> int:
+    return int((time.time() - minutes * 60) * 1000)
 
 
 def isolated_markup(directory) -> str:
@@ -73,8 +118,6 @@ def verify(directory):
     from boards.base import load_board_selectors
     from boards.wuzzuf import scraper as wu
     from boards.indeed import scraper as indeed
-    from boards.linkedin.scraper import _company_metadata
-    from scrapling import Selector
 
     # Simulate the deployed pre-enrichment schema and ensure repeat migrations
     # preserve historical jobs and delivery flags without queuing a backfill.
@@ -172,11 +215,7 @@ def verify(directory):
     assert len(recovered) == 1 and recovered[0]["extra"]["detail_status"] == "fetch_failed"
     print("PASS Indeed old/current layouts, salary/types, snippet flags, failed-detail recovery")
 
-    extra = _company_metadata(Selector((ROOT / "markup/linkedin/company_context_sample.html").read_text()),
-                              load_board_selectors("linkedin")["job_detail"])
-    assert extra["company_industry"] == "Medical Practices" and len(extra["company_description"]) > 200
-    assert not extra["company_description"].endswith("show more")
-    print("PASS LinkedIn explicit employer context")
+    verify_linkedin_api_parsing()
 
     client = Enricher()
     channels = load_channels()
@@ -446,47 +485,15 @@ def verify(directory):
         blocked_page = indeed.IndeedJobSpider({}, "http://127.0.0.1:1")
         await blocked_page.scan_search_page(FixturePage("<html><body>Access Denied</body></html>"))
         assert blocked_page._blocked
+        # LinkedIn: a job-list response without the fields we read (LinkedIn
+        # answers 200 even for a retired decoration) is an API change.
         from boards.linkedin.scraper import LinkedInJobSpider
-        class MissingCardsPage(FixturePage):
-            async def wait_for_selector(self, *args, **kwargs): raise TimeoutError("changed selector")
-        linked = LinkedInJobSpider(load_board_selectors("linkedin"), "http://127.0.0.1:1")
-        await linked.deep_scan_page(MissingCardsPage("<main>new layout</main>"))
-        assert not linked.health.checks["search_structure"]["good"]
+        changed = LinkedInJobSpider(load_board_selectors("linkedin"), "http://127.0.0.1:1")
+        await changed.scan_window(LinkedInApiPage([(200, {"data": {"metadata": {}, "elements": []}})]))
+        assert not changed.health.checks["search_structure"]["good"] and "API changed" in changed.health.error
+        assert changed.health.status == "degraded"
         for _ in range(2):
-            linked.health.report()
-        stalled = LinkedInJobSpider(load_board_selectors("linkedin"), "http://127.0.0.1:1")
-        await stalled.deep_scan_page(MissingCardsPage((ROOT / "markup/linkedin/loading_shell_sample.html").read_text()))
-        assert "startup/loading screen" in stalled.health.error
-        assert "waiting for job cards" in stalled.health.error
-        assert stalled.health.status == "degraded"
-        # A timeout while LinkedIn's app bundle is still downloading waits on
-        # the same page (a reload would restart the download, Oct 9); a stall
-        # with nothing in flight still reloads.
-        class SlowBundlePage:
-            url = "https://www.linkedin.com/jobs/search/?sortBy=DD"
-            def __init__(self, fail_waits): self.fail_waits, self.waits, self.gotos = fail_waits, [], 0
-            async def wait_for_selector(self, css, timeout):
-                self.waits.append(timeout)
-                if len(self.waits) <= self.fail_waits: raise TimeoutError("cards not yet rendered")
-            async def goto(self, *args, **kwargs): self.gotos += 1
-            async def content(self): return "<div id='app-boot-bg-loader'></div>"
-            def locator(self, css): return SimpleNamespace(first=SimpleNamespace(evaluate=AsyncMock()))
-        import boards.linkedin.scraper as li_scraper
-        with patch.object(li_scraper.asyncio, "sleep", AsyncMock()):
-            slow = LinkedInJobSpider(load_board_selectors("linkedin"), "http://127.0.0.1:1")
-            slow.diagnostics.pending[object()] = ("static.licdn.com script", time.monotonic() - 25)
-            page = SlowBundlePage(fail_waits=1)
-            assert await slow._wait_for_search(page)
-            assert page.gotos == 0 and len(page.waits) == 2 and page.waits[1] > 60_000
-            plain = LinkedInJobSpider(load_board_selectors("linkedin"), "http://127.0.0.1:1")
-            page = SlowBundlePage(fail_waits=1)
-            assert await plain._wait_for_search(page)
-            assert page.gotos == 1, "a stall with nothing downloading still reloads"
-            stuck = LinkedInJobSpider(load_board_selectors("linkedin"), "http://127.0.0.1:1")
-            stuck.diagnostics.pending[object()] = ("static.licdn.com script", time.monotonic() - 25)
-            page = SlowBundlePage(fail_waits=99)
-            assert not await stuck._wait_for_search(page)
-            assert len(page.waits) == 3 and page.gotos == 1, "one slow-asset wait per search, then the normal retry"
+            changed.health.report()
     with patch.object(telegram, "notify_failure", return_value=True) as alert, \
             patch.object(markup, "save_snapshot", return_value="test/changed.html"):
         asyncio.run(changed_markup())
@@ -626,6 +633,7 @@ def verify(directory):
     verify_browser_recovery()
     verify_linkedin_login()
     verify_first_page_and_schedule()
+    verify_person_wait()
     verify_browser_launch()
     verify_reposts()
     verify_direct_search()
@@ -688,14 +696,14 @@ def verify_reposts():
     assert f"Reposted {fresh}" in send.call_args.kwargs["plain"]
 
     # Boards report listing times for KNOWN cards only, without fallbacks.
-    assert li._listed_at(" 6 minutes ago ") and li._listed_at("1 hour ago")
-    assert li._listed_at("3 days ago") is None and li._listed_at("") is None
-    class TimedCards:
-        async def evaluate_all(self, script, arg): return [["1", "6 minutes ago"], ["2", "2 weeks ago"], ["3", "5 minutes ago"]]
-    class TimedPage:
-        def locator(self, css): return TimedCards()
+    # LinkedIn: from the job list itself (no extra request per known job).
     spider = li.LinkedInJobSpider(load_board_selectors("linkedin"), "http://127.0.0.1:1")
-    assert set(asyncio.run(spider._known_listings(TimedPage(), {"1", "2"}))) == {"1"}
+    listed = minutes_ago_ms(6)
+    body = linkedin_fixture("cards", listed_1=listed, listed_2=listed, listed_3=listed)
+    with patch.object(db, "seen_ids_for", return_value={"4400000001", "4400000003"}), \
+            patch.object(li.asyncio, "sleep", AsyncMock()):
+        asyncio.run(spider.scan_window(LinkedInApiPage([(200, body)], {"4400000002": (404, None)})))
+    assert spider.listings == {"4400000001": li._wall(listed), "4400000003": li._wall(listed)}
     # LinkedIn must never intercept requests: Playwright disables the HTTP cache
     # on routed pages and the ~3 MB app bundle then downloads every run (Oct 9).
     with patch.object(li, "AsyncStealthySession") as session_cls:
@@ -915,7 +923,28 @@ def verify_first_page_and_schedule():
     assert abs(board_budget.active_seconds(100.0, str(state), now=200.0) - 70) < 1e-6
     state.write_text(json.dumps({"paused_total": 0, "paused_since": 150.0}))
     assert abs(board_budget.active_seconds(100.0, str(state), now=200.0) - 50) < 1e-6
+    # The child replaces the file in one step, so the parent never reads it
+    # half written (truncate-then-write tore 72% of these reads; one torn read
+    # at the end of a person wait killed the board).
+    writer = ("import sys, time\n"
+              f"sys.path.insert(0, {str(ROOT)!r})\n"
+              "from core import board_budget\n"
+              "end = time.time() + 1.0\n"
+              "while time.time() < end:\n"
+              "    board_budget._write_state(123.0)\n")
+    proc = subprocess.Popen([sys.executable, "-c", writer], env={**os.environ, board_budget.STATE_ENV: str(state)})
+    torn = 0
+    while proc.poll() is None:
+        torn += not board_budget.waiting_for_person(str(state))
+    assert proc.returncode == 0 and torn == 0, f"{torn} torn budget-file reads"
+    with patch.dict(os.environ, {board_budget.STATE_ENV: str(state.parent / "gone" / "board.budget")}), \
+            patch.object(board_budget, "_write_failed", False), patch.object(board_budget.logger, "warning") as warn:
+        board_budget._write_state(1.0)
+        board_budget._write_state(None)
+        assert warn.call_count == 1, "an unwritable state file is reported once, not swallowed"
     batch = entry.db.start_scrape_batch()
+    with entry.db.get_db() as conn:  # earlier tests' Indeed jobs can share this second
+        conn.execute("UPDATE jobs SET scraped_at='2026-01-01 00:00:00' WHERE source='indeed'")
     stuck_run = entry.db.start_run("indeed")
     entry.db.save_jobs([{"source": "indeed", "external_id": "killed-run-job", "title": "T", "company": "C",
                          "posted_at": None, "description": "d", "link": "https://x", "extra": {}}])
@@ -946,7 +975,7 @@ def verify_first_page_and_schedule():
             patch.object(entry.sys, "argv", ["main.py", "--board", "wuzzuf", "--batch-id", "41"]):
         assert entry.main() == 0 and seen["batch"] == 41
     entry.db.set_active_batch(None)
-    print("PASS parallel boards: all start together, cycle waits for the slowest, failures and SIGTERM propagate, stuck board killed from outside; child joins the batch")
+    print("PASS parallel boards: all start together, cycle waits for the slowest, failures and SIGTERM propagate, stuck board killed from outside, budget file never read half written; child joins the batch")
 
     # A broken selectors.json (live-editable bind mount) skips only that board,
     # alerts once per episode, and the exit code reports the failure.
@@ -968,6 +997,275 @@ def verify_first_page_and_schedule():
     with patch.object(entry, "BOARDS", [Healthy]), patch.object(entry, "ENRICHMENT_ENABLED", True):
         assert entry._run_boards() == 0
     print("PASS broken selectors skip only their board, alert once, non-zero exit")
+
+
+def verify_person_wait():
+    """A board waiting for a person (Indeed's emailed code, a LinkedIn
+    checkpoint) never holds the cycle: on Oct 9-10 twelve such waits froze
+    every board for 130 minutes. The cycle closes without it, later cycles
+    keep the grid and skip it, its Chrome survives the stray-Chrome cleanup,
+    its run ends signed in, and a signal or the budget still stops it."""
+    import main as entry
+    import boards.indeed as indeed_board
+    import boards.linkedin as linkedin_board
+    from core import board_budget, browser
+
+    # Board side: a run that waited for a person ends signed in without
+    # scraping (its jobs would land in a closed cycle); a login that needed
+    # nobody scrapes as before.
+    class Record:
+        status = None
+        def finish(self, status, **kw):
+            self.status = self.status or status
+    for cls, flag in ((indeed_board.IndeedBoard, "logged_out"), (linkedin_board.LinkedInBoard, "needs_login")):
+        for waits in (True, False):
+            board, record, calls = cls(), Record(), []
+            def spider(cdp, _calls=calls):
+                _calls.append(cdp)
+                first = len(_calls) == 1
+                return SimpleNamespace(status="ok", error=""), {
+                    "items": [], "listings": {}, "blocked": False, "login_redirect": False,
+                    "logged_out": False, "needs_login": False, "signed_in": not first, flag: first}
+            def login_check(cdp, _waits=waits):
+                if _waits:
+                    with board_budget.paused():
+                        pass
+                return True
+            with patch.object(board, "_spider", side_effect=spider), \
+                    patch.object(board, "_login_check", side_effect=login_check):
+                assert board.scrape("cdp", record) == 0
+            expected = ("signed_in", 1) if waits else ("ok", 2)
+            assert (record.status, len(calls)) == expected, (cls.name, waits, record.status, len(calls))
+    assert board_budget.person_waits() >= 2
+
+    # Stray-Chrome cleanup spares a waiting board's whole process group.
+    procs = {100: (100, "/opt/google/chrome/chrome --remote-debugging-port=9224 --user-data-dir=/app/indeedprofile"),
+             101: (100, "/opt/google/chrome/chrome --type=renderer"),
+             200: (200, "/opt/google/chrome/chrome --remote-debugging-port=9222"),
+             201: (200, "/opt/google/chrome/chrome --type=gpu-process"),
+             300: (300, "/opt/google/chrome/chrome --remote-debugging-port=92240")}
+    assert browser._stray_chrome_pids(procs, [9224]) == [200, 201, 300]
+    assert browser._stray_chrome_pids(procs, []) == [100, 101, 200, 201, 300]
+    with patch.object(browser, "_chrome_processes", return_value=procs), patch.object(browser.os, "kill") as kill, \
+            patch.object(browser.subprocess, "run") as pkill, patch("config.KILL_CHROME_ON_START", True):
+        browser.kill_stray_chrome(keep_ports=[9224])
+        assert sorted(call.args[0] for call in kill.call_args_list) == [200, 201, 300] and not pkill.called
+        browser.kill_stray_chrome()
+        assert pkill.call_args.args[0] == ["pkill", "-f", "chrome"]
+
+    # Parent side, with real child processes that pause like a board does.
+    child = ("import sys, time\n"
+             f"sys.path.insert(0, {str(ROOT)!r})\n"
+             "from core import board_budget\n"
+             "pause, after = float(sys.argv[1]), float(sys.argv[2])\n"
+             "if pause:\n"
+             "    with board_budget.paused():\n"
+             "        time.sleep(pause)\n"
+             "time.sleep(after)\n")
+    plans, spawned = {}, []
+    def spawn(name, batch):
+        path = entry._budget_file(name)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        pause, after = plans[name].pop(0) if len(plans[name]) > 1 else plans[name][0]
+        proc = subprocess.Popen([sys.executable, "-c", child, str(pause), str(after)],
+                                env={**os.environ, board_budget.STATE_ENV: path})
+        spawned.append((name, time.time(), proc))
+        return proc
+    boards = [type(name.title(), (), {"name": name, "enabled": True, "port_offset": offset})
+              for offset, name in enumerate(("linkedin", "wuzzuf", "indeed"))]
+    period = 2.0
+    starts, finishes = [], []
+    real_start, real_finish = entry.db.start_scrape_batch, entry.db.finish_scrape_batch
+    def start_batch():
+        starts.append(time.time()); return real_start()
+    def finish_batch(batch_id, interrupted=False):
+        finishes.append(time.time()); return real_finish(batch_id, interrupted=interrupted)
+    def after_tick():  # start just after a tick so the timeline below is predictable
+        while not 0.1 <= time.time() % period <= 0.3:
+            time.sleep(0.02)
+
+    def cycle_patches(stack, signals=False):
+        stack.enter_context(patch.object(entry, "BOARDS", boards))
+        stack.enter_context(patch.object(entry, "BOARDS_PARALLEL", True))
+        stack.enter_context(patch.object(entry, "ENRICHMENT_ENABLED", True))
+        stack.enter_context(patch.object(entry, "_spawn_board", side_effect=spawn))
+        stack.enter_context(patch.object(entry, "_period", return_value=period))
+        stack.enter_context(patch.object(entry.db, "start_scrape_batch", side_effect=start_batch))
+        stack.enter_context(patch.object(entry.db, "finish_scrape_batch", side_effect=finish_batch))
+        stack.enter_context(patch.object(entry.sys, "argv", ["main.py", "--scheduled"]))
+        if not signals:
+            stack.enter_context(patch.object(entry, "_install_signal_handlers"))
+        return (stack.enter_context(patch.object(entry.browser, "kill_stray_chrome")),
+                stack.enter_context(patch.object(entry, "_start_next_cycle_now")))
+
+    # Indeed waits 4.5s for its code; LinkedIn and Wuzzuf take 0.1s.
+    plans.update(linkedin=[(0, 0.1)], wuzzuf=[(0, 0.1)], indeed=[(4.5, 0)])
+    with ExitStack() as stack:
+        stray, chain = cycle_patches(stack)
+        after_tick()
+        began = time.time()
+        assert entry.main() == 0
+        ended = time.time()
+    names = [name for name, _at, _proc in spawned]
+    assert finishes[0] - starts[0] < period, "the first cycle must close without the waiting board"
+    assert len(starts) >= 3 and names.count("indeed") == 1, (len(starts), names)
+    assert names.count("linkedin") == names.count("wuzzuf") == len(starts), "the other boards run every cycle"
+    assert all(at % period < 0.9 for at in starts[1:]), "follow-up cycles start on the scheduler's grid"
+    indeed_proc = next(proc for name, _at, proc in spawned if name == "indeed")
+    assert indeed_proc.returncode == 0, "a waiting board is never killed when its cycle closes"
+    port = entry.CHROME_DEBUG_PORT + 2
+    assert stray.call_args_list[0].kwargs["keep_ports"] == []
+    assert all(call.kwargs["keep_ports"] == [port] for call in stray.call_args_list[1:]), \
+        "the waiting board's Chrome must survive the stray cleanup"
+    assert ended - began < 4.5 + period, "the process exits once the wait ends (ofelia takes over)"
+    assert not chain.called and not entry._detached and not entry._children
+    print("PASS person wait: the cycle closes without the waiting board, later cycles keep the 3-minute grid "
+          "and skip it, its Chrome is spared, the run ends signed in")
+
+    # A signal while a board waits stops it too (compose would otherwise kill
+    # it without cleanup when the container stops).
+    spawned.clear(); starts.clear(); finishes.clear()
+    plans.update(linkedin=[(0, 0.1)], wuzzuf=[(0, 0.1)], indeed=[(60, 0)])
+    previous = signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)
+    timer = threading.Timer(1.2, os.kill, (os.getpid(), signal.SIGTERM))
+    try:
+        with ExitStack() as stack:
+            cycle_patches(stack, signals=True)
+            after_tick()
+            timer.start()
+            try:
+                entry.main()
+                raise AssertionError("SIGTERM must stop the process")
+            except SystemExit:
+                pass
+    finally:
+        timer.cancel()
+        signal.signal(signal.SIGTERM, previous[0]); signal.signal(signal.SIGINT, previous[1])
+        entry._shutting_down = False
+    indeed_proc = next(proc for name, _at, proc in spawned if name == "indeed")
+    assert indeed_proc.poll() == -signal.SIGTERM, indeed_proc.poll()
+    assert not entry._detached and not entry._children
+    with entry.db.get_db() as conn:
+        assert not conn.execute("SELECT COUNT(*) FROM scrape_batches WHERE status='running'").fetchone()[0]
+
+    # The time budget still applies after the wait (the wait itself never counts).
+    spawned.clear()
+    plans.update(indeed=[(1.5, 60)])
+    killed = []
+    with patch.object(entry, "_spawn_board", side_effect=spawn), patch.object(entry, "BOARD_TIME_BUDGET_SECONDS", 0), \
+            patch.object(entry, "_KILL_GRACE_SECONDS", 1.0), \
+            patch.object(entry.subprocess, "run", return_value=SimpleNamespace(stdout="")), \
+            patch.object(entry, "report_run_checks", side_effect=lambda name, checks: killed.append(time.time())):
+        assert entry._run_parallel(boards[2:]) is False and "indeed" in entry._detached
+        deadline = time.time() + 15
+        while entry._detached and time.time() < deadline:
+            entry._tend_detached()
+            time.sleep(0.1)
+    name, spawned_at, proc = spawned[0]
+    assert not entry._detached and proc.poll() == -signal.SIGTERM and killed
+    assert killed[0] - spawned_at > 1.5, "paused time must not count against the budget"
+    entry._children.clear()
+    print("PASS person wait: a signal stops the waiting board too; the budget still applies after the wait")
+
+    # deploy.sh: a board already stuck on a login before the switch is
+    # unverified, not a reason to roll back; a login that broke after it is.
+    deploy = (ROOT / "scripts/deploy.sh").read_text()
+    body = deploy.index("\n", deploy.index("<<'PY'")) + 1  # the heredoc starts on the next line
+    verdict = deploy[body:deploy.index("\nPY\n", body)]
+    def judge(before, cycles):
+        path = Path(tempfile.mkdtemp()) / "verdict.db"
+        conn = sqlite3.connect(path)
+        conn.executescript("CREATE TABLE scrape_batches (id INTEGER PRIMARY KEY, started_at TEXT, finished_at TEXT);"
+                           "CREATE TABLE runs (id INTEGER PRIMARY KEY, source TEXT, status TEXT, error TEXT,"
+                           " batch_id INTEGER, started_at TEXT);")
+        for source, status in before.items():
+            conn.execute("INSERT INTO runs (source, status, started_at) VALUES (?,?,?)",
+                         (source, status, "2026-10-10 11:57:00"))
+        for index, runs in enumerate(cycles):
+            at = f"2026-10-10 12:0{3 * index}:00"
+            batch = conn.execute("INSERT INTO scrape_batches (started_at, finished_at) VALUES (?,?)", (at, at)).lastrowid
+            for source, status in runs.items():
+                conn.execute("INSERT INTO runs (source, status, batch_id, started_at) VALUES (?,?,?,?)",
+                             (source, status, batch, at))
+        conn.commit(); conn.close()
+        return subprocess.run([sys.executable, "-", "2026-10-10 12:00:00", "2", str(path)], input=verdict,
+                              capture_output=True, text=True, check=True).stdout.strip()
+    ok = {"linkedin": "ok", "wuzzuf": "ok"}
+    assert judge({}, [ok, ok]) == "PASS linkedin ok/ok; wuzzuf ok/ok"
+    out = judge({"indeed": "login_failed"}, [{**ok, "indeed": "running"}, ok])
+    assert out.startswith("PASS") and "unverified" in out and "indeed running" in out, out
+    out = judge({"indeed": "ok"}, [{**ok, "indeed": "login_failed"}, {**ok, "indeed": "login_failed"}])
+    assert out == "FAIL boards never ok: indeed login_failed/login_failed", out
+    assert judge({}, [{**ok, "indeed": "signed_in"}, ok]).startswith("PASS")
+    assert judge({}, [{**ok, "linkedin": "degraded"}, {**ok, "linkedin": "degraded"}]).startswith("FAIL")
+    assert judge({}, [ok]) == "WAIT 1/2 cycles finished"
+    print("PASS deploy verdict: a login already pending before the switch is unverified, a login broken by it rolls back")
+
+
+def verify_linkedin_api_parsing():
+    """LinkedIn's job-list and posting records (synthetic fixtures, real shape)."""
+    from boards.base import load_board_selectors
+    from boards.linkedin import scraper as li
+
+    listed = [minutes_ago_ms(minutes) for minutes in (3, 20, 50)]
+    body = linkedin_fixture("cards", listed_1=listed[0], listed_2=listed[1], listed_3=listed[2])
+    window = li._parse_cards(body)
+    assert window["total"] == 3 and window["ids"] == ["4400000001", "4400000002", "4400000003"]
+    assert not window["unidentified"]
+    first = window["cards"]["4400000001"]
+    assert (first["title"], first["company"], first["location"]) == ("Data Analyst", "Example Analytics Co", "Cairo, Egypt (Hybrid)")
+    assert first["listed_ms"] == listed[0] and first["listed_at"] == li._wall(listed[0]) and first["reposted"] is False
+    assert window["cards"]["4400000003"]["reposted"] is True and "reposted" not in window["cards"]["4400000002"]
+    # LinkedIn answers 200 even for a retired decoration: the shape is the proof.
+    for broken in ({}, None, {"data": []}, {"data": {"elements": []}}, {"data": {"paging": {"total": "3"}, "elements": []}}):
+        try:
+            li._parse_cards(broken)
+        except li.ApiShapeError:
+            continue
+        raise AssertionError(f"accepted {broken}")
+    timeless = copy.deepcopy(body)
+    for entity in timeless["included"]:
+        entity.pop("footerItems", None)
+    assert not any("listed_ms" in card for card in li._parse_cards(timeless)["cards"].values())
+
+    original = minutes_ago_ms(9 * 24 * 60)
+    posting = linkedin_fixture("posting", listed_1=listed[0], original_1=original)
+    job, problem = li._job_from_posting(posting, "4400000001", first)
+    assert not problem and (job["title"], job["company"]) == ("Data Analyst", "Example Analytics Co")
+    assert job["description"].startswith("Build dashboards") and job["posted_at"] == li._wall(listed[0])
+    assert job["link"] == "https://www.linkedin.com/jobs/view/4400000001/"
+    assert job["extra"] == {
+        "detail_source": "jobs_api", "detail_location": "Cairo, Cairo, Egypt", "workplace": "Hybrid",
+        "job_type": "Full-time", "company_industry": "IT Services and IT Consulting",
+        "company_description": "Example Analytics Co builds reporting tools for retailers. It was founded in 2020.",
+        "original_listed_at": li._wall(original), "linkedin_reposted": False, "linkedin_state": "LISTED"}, job["extra"]
+    # Identity: another job's record is never saved under this ID.
+    assert li._job_from_posting(posting, "4400000002", first)[0] is None
+    # A company without a LinkedIn page names itself in companyDetails; else the card.
+    offsite = copy.deepcopy(posting)
+    offsite["data"]["companyDetails"] = {"companyName": "Offsite Ltd"}
+    assert li._job_from_posting(offsite, "4400000001", first)[0]["company"] == "Offsite Ltd"
+    offsite["data"]["companyDetails"] = {}
+    assert li._job_from_posting(offsite, "4400000001", first)[0]["company"] == "Example Analytics Co"
+    # No description = a changed decoration: a problem, never an empty job.
+    bare = copy.deepcopy(posting)
+    del bare["data"]["description"]
+    job, problem = li._job_from_posting(bare, "4400000001", first)
+    assert job is None and "description present=False" in problem
+    assert li._job_from_posting({"data": {}}, "1", {})[0] is None and li._job_from_posting(None, "1", {})[0] is None
+    # Card-only job (record failing, job about to leave the window).
+    card_job = li._job_from_card("4400000002", window["cards"]["4400000002"], "HTTP 500")
+    assert (card_job["title"], card_job["company"], card_job["description"]) == ("Site Engineer", "Example Builders", "")
+    assert card_job["extra"]["detail_status"] == "fetch_failed" and card_job["posted_at"] == li._wall(listed[1])
+    # The window query follows the configured search page.
+    assert li._search_filters() == {"geo_id": "106155005", "distance": "25"}
+    url = li.LinkedInJobSpider(load_board_selectors("linkedin"), "http://127.0.0.1:1")._cards_url(50)
+    assert all(part in url for part in ("timePostedRange:List(r3600)", "geoId:106155005", "distance:List(25)",
+                                        "start=50", "count=25", "sortBy:List(DD)")) and "{" not in url
+    print("PASS LinkedIn API parsing: window cards with listing times/repost flags, full posting record, identity, shape guardrails, card-only fallback")
 
 
 def verify_linkedin_login():
@@ -1066,6 +1364,16 @@ def verify_linkedin_login():
         assert not login._is_logged_in(Page("https://www.linkedin.com/jobs/"))
         assert not login._is_logged_in(Page("https://www.linkedin.com/login", cookies=[{"name": "li_at", "value": "x"}]))
 
+        # A checkpoint solved in its last seconds is solved (Oct 23: the page
+        # was on /feed a second after the deadline, yet the run counted a
+        # failure and cooled down 30 minutes).
+        with patch.object(login, "CHECKPOINT_WAIT_SECONDS", 0):
+            late_solve = Page("https://www.linkedin.com/checkpoint/challenge/x", redirect_to="https://www.linkedin.com/feed/")
+            assert login._handle_checkpoint(late_solve, sel) and login_state.get_retry_count() == 0
+            assert not login._handle_checkpoint(Page("https://www.linkedin.com/checkpoint/challenge/x"), sel)
+            assert login_state.get_retry_count() == 1
+        login_state.reset_retries()
+
         # Unsolved checkpoints keep cooling down but never wipe the profile.
         for _ in range(4):
             login._register_failure("checkpoint", "checkpoint unresolved")
@@ -1088,7 +1396,7 @@ def verify_linkedin_login():
         assert not login_state.should_wipe_profile()
         assert alerts.call_count == 2 and "already failed" in alerts.call_args.args[1]
         login_state.reset_retries()
-    print("PASS LinkedIn login: late feed redirect, credential lock vs transient alerts, cookie-checked /jobs, checkpoint never wipes, one wipe per streak")
+    print("PASS LinkedIn login: late feed redirect, credential lock vs transient alerts, cookie-checked /jobs, checkpoint solved at the deadline, checkpoint never wipes, one wipe per streak")
 
 
 
@@ -1271,7 +1579,41 @@ def verify_cloudflare_fast_path():
     except RuntimeError:
         pass
     assert "networkidle" in page.calls, "unreadable page: let the real solver decide"
-    print("PASS Cloudflare fast path: solver only for real challenges (two looks), retries untouched")
+    # Through the real solver's click path: its untimed post-click idle wait
+    # (the page default: 120s on Indeed) is capped; the 5s one is unchanged.
+    from core.browser import _CF_CLICK_IDLE_MS
+    class ClickPage(SyncPage):
+        """A managed challenge that clears once the checkbox is clicked."""
+        def __init__(self):
+            super().__init__([challenge])
+            self.mouse, self.idle = self, []
+        def content(self): return clean if "click" in self.calls else challenge
+        def click(self, x, y, **_kw): self.calls.append("click")
+        def frame(self, url=None): return None
+        def locator(self, _selector): return SimpleNamespace(last=SimpleNamespace(bounding_box=lambda: {"x": 0, "y": 0}))
+    class AsyncClickPage(ClickPage):
+        async def content(self): return ClickPage.content(self)
+        async def wait_for_timeout(self, ms): self.calls.append(("timeout", ms))
+        async def click(self, x, y, **_kw): self.calls.append("click")
+        def locator(self, _selector):
+            async def box(): return {"x": 0, "y": 0}
+            return SimpleNamespace(last=SimpleNamespace(bounding_box=box))
+    def click_session(asynchronous=False):
+        if asynchronous:
+            async def idle(page, timeout=None): page.idle.append(timeout)
+            async def stable(*_args): pass
+        else:
+            def idle(page, timeout=None): page.idle.append(timeout)
+            def stable(*_args): pass
+        return SimpleNamespace(_detect_cloudflare=StealthySession._detect_cloudflare, _wait_for_networkidle=idle,
+                               _challenge_cleared=StealthySession._challenge_cleared, _wait_for_page_stability=stable)
+    page = ClickPage()
+    assert StealthySession._cloudflare_solver(click_session(), page) is None and "click" in page.calls
+    assert page.idle == [5000, _CF_CLICK_IDLE_MS], page.idle
+    page = AsyncClickPage()
+    assert asyncio.run(AsyncStealthySession._cloudflare_solver(click_session(True), page)) is None
+    assert "click" in page.calls and page.idle == [5000, _CF_CLICK_IDLE_MS], page.idle
+    print("PASS Cloudflare fast path: solver only for real challenges (two looks), retries untouched, post-click idle wait capped")
 
 
 def verify_direct_search():
@@ -1298,7 +1640,7 @@ def verify_direct_search():
     assert asyncio.run(spider._signed_out(SearchPage("https://www.linkedin.com/authwall?x=1", session)))
     assert asyncio.run(spider._signed_out(SearchPage(search, RuntimeError("cdp")))), "unknown counts as signed out"
     guest = li.LinkedInJobSpider(load_board_selectors("linkedin"), "http://127.0.0.1:1")
-    asyncio.run(guest.deep_scan_page(SearchPage(search, [])))
+    asyncio.run(guest.scan_window(SearchPage(search, [])))
     assert guest._needs_login and not guest._signed_in and not guest.health.checks, "no alert: the board logs in"
 
     # Board: login check only when needed; retries reset only on a proven session.
@@ -1398,231 +1740,113 @@ def verify_browser_recovery():
     assert diagnostics.access_status == 429
 
     sel = load_board_selectors("linkedin")
-    loading = (ROOT / "markup/linkedin/loading_shell_sample.html").read_text()
-    ready_html = '<ul class="scaffold-layout__list"><li class="scaffold-layout__list-item" data-occludable-job-id="123"></li></ul>'
-    class Card:
-        def __init__(self, page): self.page = page; self.clicks = 0
-        async def get_attribute(self, name): return "123"
-        async def scroll_into_view_if_needed(self, **kwargs): pass
-        async def click(self, **kwargs):
-            self.clicks += 1
-            if self.clicks >= 2 and self.page.detail_recovers: self.page.detail_id = "123"
-    class Locator:
-        def __init__(self, page): self.page = page; self.first = self
-        async def evaluate(self, *args, **kwargs): pass
-        async def all(self): return [self.page.card] * 25  # a full, already-seen page
-        async def count(self): return 25
-    class Page(EventPage):
-        url = "https://www.linkedin.com/jobs/search/"
-        context = SignedInContext()
-        def __init__(self, recovers=True):
-            super().__init__()
-            self.recovers = recovers; self.ready = False; self.reloads = 0
-            self.detail_mode = False; self.detail_id = "old"; self.detail_recovers = True
-            self.card = Card(self)
-        async def content(self): return ready_html if self.ready else loading
-        def locator(self, css): return Locator(self)
-        async def wait_for_load_state(self, *args, **kwargs): pass
-        async def goto(self, url, **kwargs):
-            assert 0 < kwargs["timeout"] <= 30000
-            self.reloads += 1
-            self.ready = self.recovers
-            if not self.ready: self.emit("requestfailed", Request())
-        async def wait_for_selector(self, css, **kwargs):
-            assert kwargs["timeout"] > 0
-            if self.detail_mode:
-                if "/jobs/view/123/" in css and self.detail_id != "123":
-                    raise TimeoutError("previous job still visible")
-                return
-            if not self.ready: raise TimeoutError("loading")
+
+    def cards_body(ids, total=None, minutes=5, timed=True):
+        """A job-list page for these IDs, each listed `minutes` ago."""
+        listed = minutes_ago_ms(minutes)
+        return {"data": {"paging": {"total": len(ids) if total is None else total, "count": 25, "start": 0},
+                         "elements": [{"jobCardUnion": {"*jobPostingCard": f"urn:li:fsd_jobPostingCard:({i},JOBS_SEARCH)"}}
+                                      for i in ids]},
+                "included": [{"entityUrn": f"urn:li:fsd_jobPostingCard:({i},JOBS_SEARCH)", "jobPostingTitle": f"Job {i}",
+                              "primaryDescription": {"text": f"Company {i}"}, "secondaryDescription": {"text": "Cairo, Egypt"},
+                              **({"footerItems": [{"type": "LISTED_DATE", "timeAt": listed}]} if timed else {})}
+                             for i in ids]}
+
+    def posting(job_id, state="LISTED"):
+        body = linkedin_fixture("posting", listed_1=minutes_ago_ms(5), original_1=minutes_ago_ms(5))
+        body["data"].update(jobPostingId=int(job_id), entityUrn=f"urn:li:fs_normalized_jobPosting:{job_id}",
+                            title=f"Job {job_id}", jobState=state)
+        return body
+
+    async def run(page, known=()):
+        spider = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")
+        spider.on_job = (saved := []).append
+        with patch.object(db, "seen_ids_for", side_effect=lambda source, keys: set(keys) & set(known)):
+            await spider.scan_window(page)
+        return spider, saved
 
     async def scenarios():
-        recovered = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")
-        page = Page()
-        await recovered.setup_search_page(page)
-        with patch.object(db, "seen_ids_for", return_value={"123"}):
-            await recovered.deep_scan_page(page)
-        assert page.reloads == 1 and recovered.health.status == "ok"
-        assert not recovered._page_jobs  # all-seen remains normal after recovery
+        ids = [str(4480000000 + i) for i in range(30)]
+        # The whole window over two pages; only new IDs get a posting record and
+        # each is handed to the board (save_now) at once; known IDs report
+        # their listing time (repost detection).
+        page = LinkedInApiPage([(200, cards_body(ids[:25], total=30)), (200, cards_body(ids[25:], total=30))],
+                               {i: (200, posting(i)) for i in ids})
+        spider, saved = await run(page, known=ids[:27])
+        assert spider.health.status == "ok", spider.health.error
+        assert {"search_fetch", "search_structure", "window_complete", "card_ids", "listing_times", "window_filter",
+                "detail_fetch", "detail_content"} <= set(spider.health.checks)
+        assert [job["external_id"] for job in saved] == ids[27:] and all(job["description"] for job in saved)
+        assert ["JobCards" in url for url in page.calls] == [True, True, False, False, False]
+        assert "start=25" in page.calls[1] and set(spider.listings) == set(ids[:27])
+        # All known: one list call, no records; an empty window (night) is valid.
+        page = LinkedInApiPage([(200, cards_body(ids[:3]))])
+        spider, saved = await run(page, known=ids[:3])
+        assert not saved and len(page.calls) == 1 and spider.health.status == "ok"
+        spider, saved = await run(LinkedInApiPage([(200, cards_body([]))]))
+        assert not saved and spider.health.status == "ok"
 
-        stalled = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")
-        page = Page(recovers=False)
-        await stalled.setup_search_page(page)
-        await stalled.deep_scan_page(page)
-        assert page.reloads == 1 and stalled.health.status == "degraded"
-        assert "ERR_NETWORK_CHANGED" in stalled.health.error
+        # Guardrails on the list: shape change, no listing times (jobs still
+        # read), ignored time filter, incomplete window, entries without an ID.
+        spider, _ = await run(LinkedInApiPage([(200, {"data": {"metadata": {}}})]))
+        assert not spider.health.checks["search_structure"]["good"] and "API changed" in spider.health.error
+        spider, saved = await run(LinkedInApiPage([(200, cards_body(ids[:3], timed=False))], {i: (200, posting(i)) for i in ids}))
+        assert not spider.health.checks["listing_times"]["good"] and len(saved) == 3
+        spider, _ = await run(LinkedInApiPage([(200, cards_body(ids[:20], minutes=300))]), known=ids)
+        assert not spider.health.checks["window_filter"]["good"] and spider.health.checks["window_complete"]["good"]
+        spider, _ = await run(LinkedInApiPage([(200, cards_body(ids[:25], total=40)), (200, cards_body([], total=40))]), known=ids)
+        assert not spider.health.checks["window_complete"]["good"] and "25 of the 40" in spider.health.error
+        odd = cards_body(ids[:2])
+        odd["data"]["elements"].append({"jobCardUnion": {"*jobPostingCard": "urn:li:fsd_promotedCard:1"}})
+        spider, _ = await run(LinkedInApiPage([(200, odd)]), known=ids)
+        assert not spider.health.checks["card_ids"]["good"]
 
-        for restricted in ("checkpoint", "rate_limit"):
-            blocked = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")
-            page = Page()
-            if restricted == "checkpoint": page.url = "https://www.linkedin.com/checkpoint/challenge"
-            else: blocked.diagnostics.access_status = 429
-            await blocked.deep_scan_page(page)
-            if restricted == "checkpoint":  # the board's login check handles (and alerts) checkpoints
-                assert page.reloads == 0 and blocked._needs_login and not blocked.health.checks
-            else:
-                assert page.reloads == 0 and blocked.health.status == "degraded"
+        # Access: 401 or a redirect to sign-in = the board's login check (no
+        # alert); 429 is never retried; a 5xx, a navigation race and a stale
+        # CSRF token retry once; a page without JSESSIONID cannot call the API.
+        for answer in ((401, ""), (200, cards_body(ids[:1]), "https://www.linkedin.com/checkpoint/challenge/x")):
+            spider, _ = await run(LinkedInApiPage([answer]))
+            assert spider._needs_login and "search_structure" not in spider.health.checks
+        page = LinkedInApiPage([(429, "")])
+        spider, _ = await run(page)
+        assert len(page.calls) == 1 and "limiting" in spider.health.error
+        for first in ((503, ""), RuntimeError("Execution context was destroyed")):
+            page = LinkedInApiPage([first, (200, cards_body(ids[:1]))], {ids[0]: (200, posting(ids[0]))})
+            spider, saved = await run(page)
+            assert len(saved) == 1 and spider.health.status == "ok", spider.health.error
+        page = LinkedInApiPage([(403, "CSRF check failed."), (200, cards_body([]))])
+        spider, _ = await run(page)
+        assert spider.health.status == "ok" and page.context.cookies.await_count >= 3, "token read again"
+        spider, _ = await run(LinkedInApiPage([(200, cards_body([]))], cookies=[{"name": "li_at", "value": "x"}]))
+        assert "JSESSIONID" in spider.health.error
 
-        detail = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")
-        page = Page(); page.detail_mode = True
-        assert await detail._open_card(page, page.card, "123")
-        assert page.card.clicks == 2 and not detail._detail_failures
-        page = Page(); page.detail_mode = True; page.detail_recovers = False
-        assert not await detail._open_card(page, page.card, "123")
-        assert page.card.clicks == 2 and "123" in detail._detail_failures
-        page = Page(); page.detail_mode = True; page.url = "https://www.linkedin.com/login"
-        assert not await detail._open_card(page, page.card, "123")
-        assert page.card.clicks == 1
-
-        # The list loads top-first: wait for all 25 before reading IDs; a list
-        # that stays short, or cards without IDs, raise once-per-episode checks.
-        class IdCard:
-            def __init__(self, job_id): self.job_id = job_id
-            async def get_attribute(self, name): return self.job_id
-        class GrowingList:
-            def __init__(self, counts, ids): self.counts, self.ids, self.current = list(counts), ids, 0
-            first = property(lambda self: self)
-            async def count(self):
-                self.current = self.counts.pop(0) if self.counts else self.current
-                return self.current
-            async def all(self): return [IdCard(i) for i in self.ids[:self.current]]
-            async def evaluate(self, *args, **kwargs): pass
-        class ListPage:
-            url = "https://www.linkedin.com/jobs/search/"
-            context = SignedInContext()
-            def __init__(self, cards): self.cards = cards
-            def locator(self, css): return self.cards
-            async def content(self): return "<html></html>"
-        ids = [str(4477000000 + i) for i in range(25)]
-        async def scan(counts, card_ids):
-            spider = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")
-            with patch.object(spider, "_wait_for_search", AsyncMock(return_value=True)), \
-                    patch.object(db, "seen_ids_for", return_value=set(ids)):
-                await spider.deep_scan_page(ListPage(GrowingList(counts, card_ids)))
-            return spider.health.checks
-        checks = await scan([7, 7, 12, 25], ids)
-        assert checks["full_page"]["good"] and checks["card_ids"]["good"]
-        checks = await scan([7], ids)
-        assert not checks["full_page"]["good"] and "Only 7 of 25" in checks["full_page"]["detail"]
-        checks = await scan([25], ids[:24] + [None])
-        assert not checks["card_ids"]["good"] and "1 of 25" in checks["card_ids"]["detail"]
-        # Each new job is handed to the board (save_now) as soon as it is scraped.
-        saved = []
-        fresh = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")
-        fresh.on_job = saved.append
-        with patch.object(fresh, "_wait_for_search", AsyncMock(return_value=True)), \
-                patch.object(fresh, "_scrape_card", AsyncMock(side_effect=lambda page, card, job_id: {"external_id": job_id})), \
-                patch.object(db, "seen_ids_for", return_value=set()):
-            await fresh.deep_scan_page(ListPage(GrowingList([25], ids)))
-        assert [job["external_id"] for job in saved] == ids
-        # Job-cards API: exact listing times (cards no longer render one) and
-        # LinkedIn's repost flag; synthetic body, no captured account data.
-        epoch = int(datetime(2026, 10, 9, 17, 5).timestamp() * 1000)
-        body = {"included": [
-            {"jobPostingUrn": f"urn:li:fsd_jobPosting:{ids[0]}",
-             "footerItems": [{"type": "LISTED_DATE", "timeAt": epoch}, {"type": "EASY_APPLY_TEXT"}]},
-            {"entityUrn": f"urn:li:fsd_jobPosting:{ids[0]}", "repostedJob": True},
-            {"jobPostingUrn": f"urn:li:fsd_jobPosting:{ids[1]}", "footerItems": [{"type": "LISTED_DATE", "timeAt": "bad"}]},
-            "not-an-entity", {"entityUrn": "urn:li:fsd_company:1"}]}
-        assert li._cards_from_api(body) == {ids[0]: {"listed_at": "2026-10-09 17:05", "reposted": True}}
-        assert li._cards_from_api({}) == {} and li._cards_from_api(None) == {}
-        api = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")
-        class CardsResponse:
-            url = "https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards?count=25"
-            async def json(self): return body
-        api._on_response(SimpleNamespace(url="https://www.linkedin.com/voyager/api/graphql"))
-        api._on_response(CardsResponse())
-        assert (await api._api_cards_ready())[ids[0]]["listed_at"] == "2026-10-09 17:05"
-        api.on_job = (api_saved := []).append
-        with patch.object(api, "_wait_for_search", AsyncMock(return_value=True)), \
-                patch.object(api, "_scrape_card", AsyncMock(side_effect=lambda page, card, job_id:
-                    {"external_id": job_id, "posted_at": "rounded", "extra": {}})), \
-                patch.object(db, "seen_ids_for", return_value=set(ids[1:])):
-            await api.deep_scan_page(ListPage(GrowingList([25], ids)))
-        assert api_saved[0]["posted_at"] == "2026-10-09 17:05" and api_saved[0]["extra"]["linkedin_reposted"] is True
-        # Clicked job: its API records (JobPosting + TOP_CARD) give the core
-        # fields keyed by ID; the panel DOM only adds "About the company".
-        listed = int(datetime(2026, 10, 9, 17, 5).timestamp() * 1000)
-        posting = {"included": [
-            {"entityUrn": "urn:li:fsd_jobPosting:4477000001", "title": "Data Developer",
-             "description": {"text": "Build data pipelines.\nSQL and Python."},
-             "companyDetails": {"name": "Talent Mastery"}, "listedAt": listed, "originalListedAt": listed,
-             "repostedJob": False, "*employmentStatus": "urn:li:fsd_employmentStatus:FULL_TIME",
-             "*location": "urn:li:fsd_geo:1", "*industryV2Taxonomy": ["urn:li:fsd_industryV2:96"]},
-            {"entityUrn": "urn:li:fsd_geo:1", "defaultLocalizedName": "Cairo, Egypt"},
-            {"entityUrn": "urn:li:fsd_employmentStatus:FULL_TIME", "localizedName": "Full-time"},
-            {"entityUrn": "urn:li:fsd_industryV2:96", "name": "IT Services and IT Consulting"}, "junk"]}
-        top_card = {"included": [
-            {"entityUrn": "urn:li:fsd_jobPosting:4477000001", "title": "Data Developer",
-             "*jobWorkplaceTypes": ["urn:li:fsd_workplaceType:1"]},
-            {"entityUrn": "urn:li:fsd_workplaceType:1", "localizedName": "On-site", "workplaceTypeEnum": "ON_SITE"}]}
-        store = {"jobs": {}, "names": {}}
-        li._merge_job_entities(store, posting)
-        assert li._api_detail(store, "4477000001")["workplace"] is None
-        li._merge_job_entities(store, top_card)
-        detail = li._api_detail(store, "4477000001")
-        assert detail == {"title": "Data Developer", "company": "Talent Mastery",
-                          "description": "Build data pipelines.\nSQL and Python.", "detail_location": "Cairo, Egypt",
-                          "job_type": "Full-time", "workplace": "On-site", "industry": "IT Services and IT Consulting",
-                          "listed_at": "2026-10-09 17:05", "original_listed_at": "2026-10-09 17:05", "reposted": False}, detail
-        assert li._api_detail(store, "999") is None and li._api_detail({"jobs": {}, "names": {}}, "1") is None
-        class PanelLocator:
-            def __init__(self, html, n): self.html, self.n, self.first = html, n, self
-            async def inner_html(self): return self.html
-            async def count(self): return self.n
-            async def text_content(self): return ""
-        class PanelPage:
-            url = "https://www.linkedin.com/jobs/search/"
-            def __init__(self, html): self.html = html
-            def locator(self, css): return PanelLocator(self.html, 0 if css == sel["search"]["login_redirect"] else 1)
-            async def content(self): return self.html
-        stale_panel = '<div class="job-view-layout"><h1 class="t-24 t-bold">Previous job</h1><div id="job-details">old text</div></div>'
-        fast = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")
-        fast._job_api = store
-        settles = []
-        async def record_sleep(seconds): settles.append(seconds)
-        with patch.object(fast, "_open_card", AsyncMock(return_value=True)), \
-                patch.object(li.asyncio, "sleep", side_effect=record_sleep):
-            job = await fast._scrape_card(PanelPage(stale_panel), None, "4477000001")
-        assert job["title"] == "Data Developer" and job["description"].startswith("Build data pipelines")
-        assert job["company"] == "Talent Mastery" and job["posted_at"] == "2026-10-09 17:05"
-        assert {k: job["extra"][k] for k in ("workplace", "job_type", "detail_location", "company_industry", "detail_source")} == {
-            "workplace": "On-site", "job_type": "Full-time", "detail_location": "Cairo, Egypt",
-            "company_industry": "IT Services and IT Consulting", "detail_source": "jobs_api"}, job["extra"]
-        assert not any(s >= 0.5 for s in settles), f"no fixed hydration settles on the API path: {settles}"
-        # No API record: the panel DOM path with its hydration waits (real,
-        # shortened timers); after two misses without a hit the run stops
-        # waiting for the API; a record landing mid-wait is used at once.
-        real_sleep = asyncio.tasks.sleep  # scenarios() mocks asyncio.sleep
-        slow = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")
-        panel = '<div class="job-view-layout"><h1 class="t-24 t-bold">Panel title</h1><div id="job-details">Panel text</div></div>'
-        with patch.object(slow, "_open_card", AsyncMock(return_value=True)), \
-                patch.object(li.asyncio, "sleep", new=real_sleep), patch.object(li.random, "uniform", return_value=0.05), \
-                patch.object(li, "_API_DETAIL_WAIT", 0.05):
-            job = await slow._scrape_card(PanelPage(panel), None, "4477000002")
-            assert job["title"] == "Panel title" and job["extra"]["detail_source"] == "panel"
-            await slow._scrape_card(PanelPage(panel), None, "4477000003")
-            started = time.monotonic()
-            assert await slow._await_api_detail("4477000004", 5) is None and time.monotonic() - started < 0.1
-            late = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")
-            async def lands():
-                await real_sleep(0.15)
-                li._merge_job_entities(late._job_api, posting)
-                li._merge_job_entities(late._job_api, top_card)
-            with patch.object(late, "_open_card", AsyncMock(return_value=True)), \
-                    patch.object(li.random, "uniform", return_value=0.5):
-                landing = asyncio.ensure_future(lands())
-                started = time.monotonic()
-                job = await late._scrape_card(PanelPage(panel), None, "4477000001")
-                await landing
-            assert job["extra"]["detail_source"] == "jobs_api" and job["title"] == "Data Developer"
-            assert time.monotonic() - started < 0.5, "stops waiting as soon as the record lands"
-        known = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")
-        known._api_cards = {key: {"listed_at": "2026-10-09 16:00"} for key in ids}
-        with patch.object(known, "_wait_for_search", AsyncMock(return_value=True)), \
-                patch.object(db, "seen_ids_for", return_value=set(ids)):
-            await known.deep_scan_page(ListPage(GrowingList([25], ids)))
-        assert len(known.listings) == 25, "known cards get their listing time from the API"
+        # Posting records: a deleted (404) or suspended job is skipped (retried
+        # while still listed); a record for another job is unusable and the
+        # job is saved from its card; a failing record waits for the next
+        # run, unless the job could leave the window first.
+        page = LinkedInApiPage([(200, cards_body(ids[:5]))], {
+            ids[0]: (404, None), ids[1]: (200, posting(ids[1], state="SUSPENDED")),
+            ids[2]: (200, posting(ids[9])), ids[3]: (500, ""), ids[4]: (200, posting(ids[4]))})
+        spider, saved = await run(page)
+        assert [job["external_id"] for job in saved] == [ids[2], ids[4]]
+        assert saved[0]["extra"]["detail_status"] == "fetch_failed" and not saved[0]["description"]
+        assert saved[0]["title"] == f"Job {ids[2]}" and saved[1]["description"]
+        assert not spider.health.checks["detail_content"]["good"] and not spider.health.checks["detail_fetch"]["good"]
+        assert sum(ids[3] in url for url in page.calls) == 2, "a 5xx record is retried once"
+        spider, saved = await run(LinkedInApiPage([(200, cards_body(ids[:1], minutes=50))], {ids[0]: (500, "")}))
+        assert len(saved) == 1 and saved[0]["extra"]["detail_status"] == "fetch_failed", "saved before it leaves the window"
+        page = LinkedInApiPage([(200, cards_body(ids[:4]))], {i: (429, "") for i in ids})
+        spider, saved = await run(page)
+        assert sum("jobPostings" in url for url in page.calls) == 1 and not saved and "limiting" in spider.health.error
+        spider, _ = await run(LinkedInApiPage([(200, cards_body(ids[:2]))], {i: (401, "") for i in ids}))
+        assert spider._needs_login
+        # Per-run cap, oldest listing first (it leaves the window first).
+        body = cards_body(ids[:4])
+        for n, entity in enumerate(body["included"]):
+            entity["footerItems"][0]["timeAt"] = minutes_ago_ms(10 + n)
+        with patch.object(li, "LINKEDIN_MAX_DETAILS_PER_RUN", 2):
+            spider, saved = await run(LinkedInApiPage([(200, body)], {i: (200, posting(i)) for i in ids}))
+        assert [job["external_id"] for job in saved] == [ids[3], ids[2]]
         view = (ROOT / "markup/indeed/newjob_sample.html").read_text()
         detail_spider = indeed.IndeedJobSpider({}, "http://127.0.0.1:1")
         detail_saved = []
@@ -1634,32 +1858,15 @@ def verify_browser_recovery():
             async def content(self): return view
         await detail_spider.scan_detail_page(DetailPage(), key=key)
         assert [job["external_id"] for job in detail_saved] == [key]
-        # Slow link: the rest of the list arrives in one late jump. A still
-        # count is not "settled" while LinkedIn data requests are in flight.
-        class SlowList(GrowingList):
-            async def count(self):
-                time.sleep(0.01)
-                return await super().count()
-        late = [7] * 20 + [25]
-        waiting = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")
-        waiting.diagnostics.pending[object()] = ("www.linkedin.com fetch", time.monotonic())
-        assert len(await waiting._settled_cards(ListPage(SlowList(late, ids)))) == 25
-        idle = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")
-        assert len(await idle._settled_cards(ListPage(SlowList(late, ids)))) == 7
-        stream = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")  # long-lived stream: ignored
-        stream.diagnostics.pending[object()] = ("www.linkedin.com fetch", time.monotonic() - 60)
-        assert len(await stream._settled_cards(ListPage(SlowList(late, ids)))) == 7
-
         failed = li.LinkedInJobSpider(sel, "http://127.0.0.1:1")
         failed.health.check("search_fetch", True)  # earlier page worked
         await failed.on_error(None, RuntimeError("net::ERR_CONNECTION_CLOSED https://private/?token=secret"))
         assert failed.health.status == "degraded" and "ERR_CONNECTION_CLOSED" in failed.health.error
         assert "token" not in failed.health.error
 
-    with patch.object(li, "LINKEDIN_SEARCH_RECOVERY_ATTEMPTS", 1), patch.object(asyncio, "sleep", new=AsyncMock()), \
-            patch.object(li, "_STABLE_SECONDS", 0.05), patch.object(li, "_SETTLE_SECONDS", 0.5):
+    with patch.object(asyncio, "sleep", new=AsyncMock()):
         asyncio.run(scenarios())
-    print("PASS network/HTTP diagnostics, bounded search/detail recovery, job identity, access stops, complete card list")
+    print("PASS network/HTTP diagnostics; LinkedIn API window: complete paging, repost listings, shape/filter/completeness guardrails, access stops, retries, record identity, card fallback, per-run cap")
 
 
 if __name__ == "__main__":

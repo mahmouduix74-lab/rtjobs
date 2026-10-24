@@ -1,0 +1,125 @@
+{
+ "data": {
+  "$type": "com.linkedin.restli.common.CollectionResponse",
+  "entityUrn": "urn:li:fsd_jobSearchResult:offline",
+  "metadata": {
+   "origin": "JOB_SEARCH_PAGE_JOB_FILTER",
+   "geoUrn": "urn:li:fsd_geo:106155005"
+  },
+  "paging": {
+   "total": 3,
+   "count": 25,
+   "start": 0,
+   "links": []
+  },
+  "elements": [
+   {
+    "jobCardUnion": {
+     "*jobPostingCard": "urn:li:fsd_jobPostingCard:(4400000001,JOBS_SEARCH)"
+    },
+    "$type": "com.linkedin.voyager.dash.jobs.JobCard"
+   },
+   {
+    "jobCardUnion": {
+     "*jobPostingCard": "urn:li:fsd_jobPostingCard:(4400000002,JOBS_SEARCH)"
+    },
+    "$type": "com.linkedin.voyager.dash.jobs.JobCard"
+   },
+   {
+    "jobCardUnion": {
+     "*jobPostingCard": "urn:li:fsd_jobPostingCard:(4400000003,JOBS_SEARCH)"
+    },
+    "$type": "com.linkedin.voyager.dash.jobs.JobCard"
+   }
+  ]
+ },
+ "included": [
+  {
+   "$type": "com.linkedin.voyager.dash.jobs.JobPostingCard",
+   "entityUrn": "urn:li:fsd_jobPostingCard:(4400000001,JOBS_SEARCH)",
+   "jobPostingUrn": "urn:li:fsd_jobPosting:4400000001",
+   "*jobPosting": "urn:li:fsd_jobPosting:4400000001",
+   "jobPostingTitle": "Data Analyst",
+   "primaryDescription": {
+    "text": "Example Analytics Co",
+    "$type": "com.linkedin.voyager.dash.common.text.TextViewModel"
+   },
+   "secondaryDescription": {
+    "text": "Cairo, Egypt (Hybrid)",
+    "$type": "com.linkedin.voyager.dash.common.text.TextViewModel"
+   },
+   "footerItems": [
+    {
+     "type": "LISTED_DATE",
+     "timeAt": "LISTED_1"
+    },
+    {
+     "type": "EASY_APPLY_TEXT",
+     "text": {
+      "text": "Easy Apply"
+     }
+    }
+   ]
+  },
+  {
+   "$type": "com.linkedin.voyager.dash.jobs.JobPostingCard",
+   "entityUrn": "urn:li:fsd_jobPostingCard:(4400000002,JOBS_SEARCH)",
+   "jobPostingUrn": "urn:li:fsd_jobPosting:4400000002",
+   "*jobPosting": "urn:li:fsd_jobPosting:4400000002",
+   "jobPostingTitle": "Site Engineer",
+   "primaryDescription": {
+    "text": "Example Builders"
+   },
+   "secondaryDescription": {
+    "text": "Egypt (On-site)"
+   },
+   "footerItems": [
+    {
+     "type": "LISTED_DATE",
+     "timeAt": "LISTED_2"
+    }
+   ]
+  },
+  {
+   "$type": "com.linkedin.voyager.dash.jobs.JobPostingCard",
+   "entityUrn": "urn:li:fsd_jobPostingCard:(4400000003,JOBS_SEARCH)",
+   "jobPostingUrn": "urn:li:fsd_jobPosting:4400000003",
+   "*jobPosting": "urn:li:fsd_jobPosting:4400000003",
+   "jobPostingTitle": "Accountant",
+   "primaryDescription": {
+    "text": "Example Trading"
+   },
+   "secondaryDescription": {
+    "text": "Egypt (Remote)"
+   },
+   "footerItems": [
+    {
+     "type": "LISTED_DATE",
+     "timeAt": "LISTED_3"
+    }
+   ]
+  },
+  {
+   "$type": "com.linkedin.voyager.dash.jobs.JobPostingCard",
+   "entityUrn": "urn:li:fsd_jobPostingCard:(4400000001,JOB_DETAILS)"
+  },
+  {
+   "$type": "com.linkedin.voyager.dash.jobs.JobPosting",
+   "entityUrn": "urn:li:fsd_jobPosting:4400000001",
+   "title": "Data Analyst",
+   "repostedJob": false,
+   "contentSource": "JOBS_PREMIUM"
+  },
+  {
+   "$type": "com.linkedin.voyager.dash.jobs.JobPosting",
+   "entityUrn": "urn:li:fsd_jobPosting:4400000003",
+   "title": "Accountant",
+   "repostedJob": true,
+   "contentSource": "JOBS_CREATE"
+  },
+  {
+   "$type": "com.linkedin.voyager.dash.organization.Company",
+   "entityUrn": "urn:li:fsd_company:1"
+  }
+ ]
+}

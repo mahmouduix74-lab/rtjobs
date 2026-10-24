@@ -34,7 +34,11 @@ or publishes part of that response. Validated cache hits can be saved separately
 Classification results are saved per job. Shared token usage and cost belong to
 one `enrichment_requests` row; each new enrichment references its request ID.
 Budget is reserved before calling and reconciled with reported cost, including
-paid invalid responses. Uncertain billing after a timeout retains its reservation.
+paid invalid responses. A failure the provider provably did not bill releases the
+whole reservation: nothing was sent (no API key, connection failure, the audit row
+could not be written) or the provider answered with an error status (4xx/5xx).
+Uncertain billing (a timeout, a broken response body, a 2xx answer that fails
+validation without a reported cost) retains it.
 The reservation covers advertised long-context pricing tiers conservatively.
 
 Saving validated results immediately notifies the delivery worker. It posts by job family,

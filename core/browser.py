@@ -128,21 +128,57 @@ def _port_in_use(port: int) -> bool:
         return probe.connect_ex(("127.0.0.1", port)) == 0
 
 
-def kill_stray_chrome() -> None:
+def kill_stray_chrome(keep_ports=()) -> None:
     """Kill every Chrome process left from a crashed run (container only).
 
     Runs ONCE per cycle in main.py BEFORE any board starts: with boards in
     parallel, a per-board `pkill -f chrome` would kill the other boards'
     browsers. Stale profile locks are cleared per launch (clean_locks).
+    keep_ports: CDP ports of boards still waiting for a person from an earlier
+    cycle; their Chrome (its whole process group) is spared.
     """
     from config import KILL_CHROME_ON_START
     if not KILL_CHROME_ON_START:
         return
     logger.info("[browser] Killing stray Chrome processes...")
-    try:
-        subprocess.run(["pkill", "-f", "chrome"], capture_output=True, timeout=10)
-    except Exception:
-        pass
+    if not keep_ports:
+        try:
+            subprocess.run(["pkill", "-f", "chrome"], capture_output=True, timeout=10)
+        except Exception:
+            pass
+        return
+    for pid in _stray_chrome_pids(_chrome_processes(), keep_ports):
+        try:
+            os.kill(pid, signal.SIGTERM)  # what pkill sends
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _chrome_processes() -> dict[int, tuple[int, str]]:
+    """{pid: (process group, command line)} of every process whose command
+    line contains "chrome" (what `pkill -f chrome` matches), except us."""
+    found = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                cmdline = handle.read().replace(b"\0", b" ").decode(errors="replace")
+            if "chrome" in cmdline:
+                found[int(entry)] = (os.getpgid(int(entry)), cmdline)
+        except (OSError, ProcessLookupError):
+            continue
+    return found
+
+
+def _stray_chrome_pids(processes: dict[int, tuple[int, str]], keep_ports) -> list[int]:
+    """Chrome processes to kill: all except the process groups of the browsers
+    listening on keep_ports. A browser leads its own group (launch_cdp_chrome
+    starts it in a new session); its renderer, GPU and utility processes share
+    the group but not the port flag."""
+    flags = {f"--remote-debugging-port={port}" for port in keep_ports}
+    kept = {group for group, cmdline in processes.values() if flags & set(cmdline.split())}
+    return sorted(pid for pid, (group, _cmdline) in processes.items() if group not in kept)
 
 
 def chrome_args(chrome: str, profile_dir: str, port: int, headless: bool = False,
@@ -422,6 +458,8 @@ def verify_scrapling_contract() -> None:
                 continue
             if len(params) < arity:
                 problems.append(f"{cls.__name__}.{name} takes {len(params)} parameters, we pass {arity}")
+            elif name == "_wait_for_networkidle" and "timeout" not in params:
+                problems.append(f"{cls.__name__}._wait_for_networkidle has no timeout parameter")
     for name in ("_get_page_content", "_get_async_page_content"):
         if not callable(getattr(ResponseFactory, name, None)):
             problems.append(f"ResponseFactory.{name} is missing")
@@ -437,6 +475,36 @@ def verify_scrapling_contract() -> None:
 # Second look before skipping the solver: catches a challenge that replaces
 # the page right after DOMContentLoaded.
 _CF_RECHECK_MS = 1000
+# Cap for the solver's network-idle wait after it clicks the Turnstile box.
+_CF_CLICK_IDLE_MS = 10_000
+
+
+class _SolverView:
+    """The session as scrapling's Cloudflare solver sees it: the same session,
+    except that an untimed `_wait_for_networkidle` waits at most
+    _CF_CLICK_IDLE_MS.
+
+    After clicking the checkbox the solver calls `_wait_for_networkidle(page)`
+    with no timeout, i.e. the page default: 120s on Indeed, whose pages never
+    go idle. 321 of 361 Indeed solves (Oct 14-24) took 115-125s. Usually the
+    challenge had cleared by the end of the wait (solves whose page did go
+    idle took 4-8s in all); otherwise the solver then polled 10s and retried,
+    and the retry solved it in ~5s. The solver's
+    other wait (5s, before detection) passes through unchanged, and its retry
+    (`self._cloudflare_solver`) reaches the patched solver, which wraps the
+    session again. A view per call, not a patched session, so concurrent
+    solves on one async session cannot undo each other's cap.
+    """
+
+    def __init__(self, session):
+        self._session = session
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+    def _wait_for_networkidle(self, page, timeout=None):
+        return self._session._wait_for_networkidle(
+            page, timeout=_CF_CLICK_IDLE_MS if timeout is None else timeout)
 
 
 def install_cloudflare_fast_path() -> None:
@@ -449,8 +517,10 @@ def install_cloudflare_fast_path() -> None:
     Indeed: every search and detail fetch). Detection is the solver's own
     `_detect_cloudflare` on the page HTML (cType marker or embedded Turnstile
     script), checked at once and again after _CF_RECHECK_MS; a challenge gets
-    the original solver untouched (retries pass _attempts > 0 straight
-    through). A challenge missed by both looks shows up in the board's own
+    the original solver (retries pass _attempts > 0 straight through), run
+    against a _SolverView so its post-click network-idle wait is capped at
+    _CF_CLICK_IDLE_MS instead of the page default (Indeed: 120s on most
+    solves). A challenge missed by both looks shows up in the board's own
     page checks (blocked/degraded run) and is solved on the next run.
     Idempotent.
     """
@@ -479,7 +549,7 @@ def install_cloudflare_fast_path() -> None:
                     break
             else:
                 return None
-        return sync_solver(self, page, _attempts)
+        return sync_solver(_SolverView(self), page, _attempts)
 
     async def async_solver_fast(self, page, _attempts: int = 0):
         if _attempts == 0:
@@ -494,7 +564,7 @@ def install_cloudflare_fast_path() -> None:
                     break
             else:
                 return None
-        return await async_solver(self, page, _attempts)
+        return await async_solver(_SolverView(self), page, _attempts)
 
     StealthySession._cloudflare_solver = solver
     AsyncStealthySession._cloudflare_solver = async_solver_fast

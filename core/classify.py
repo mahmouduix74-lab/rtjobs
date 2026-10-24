@@ -29,6 +29,10 @@ class OutputValidationError(EnrichmentError):
     """A completed response needs correction, rather than provider backoff."""
 
 
+class RequestNotSent(EnrichmentError):
+    """Raised before any request reached the provider, so nothing was billed."""
+
+
 class Enricher:
     def __init__(self):
         folder = Path(MARKUP_DIR) / "enrichment"
@@ -125,8 +129,9 @@ class Enricher:
         """Conservative per-request reservation, using advertised model prices.
 
         UTF-8 bytes bound input tokens; doubling the estimate leaves room for
-        framing/cache pricing. Failed requests retain their reservation because
-        a timeout does not prove the provider did not perform billable work.
+        framing/cache pricing. A failed request keeps its reservation unless
+        the provider provably did not bill it (see the enrichment worker): a
+        timeout does not prove the provider did not perform billable work.
         """
         if self.pricing is None:
             try:
@@ -190,7 +195,7 @@ class Enricher:
     def classify_batch(self, data: list[dict], feedback: str = "") -> tuple[list[dict], dict]:
         """One completion request for the complete supplied scrape batch."""
         if not OPENROUTER_API_KEY:
-            raise EnrichmentError("OpenRouter API key is missing")
+            raise RequestNotSent("OpenRouter API key is missing")
         payload = self.payload(data, feedback)
         if self.pricing:
             # Refuse routes charging above the prices used for the reservation.

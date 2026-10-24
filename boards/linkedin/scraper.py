@@ -1,32 +1,54 @@
-"""LinkedIn job spider built on scrapling's Spider framework.
+"""LinkedIn jobs from LinkedIn's own job-search API, read inside a signed-in page.
 
-ONE search page per run (the newest 25, sortBy=DD), every card on it checked:
-the schedule runs often enough that anything on page 2 is already minutes old,
-and no "stop at the first known card" rule can skip promoted/reposted cards.
+Since 2026-10-21 `/jobs/search/` redirects to an AI search page (relevance
+order, randomized class names), so job cards can no longer be read from the
+DOM. Each run opens the search page as before (it proves the session, Gotchas
+#5) and then, from INSIDE that page (real Chrome: its cookies, TLS and
+headers, the same requests LinkedIn's web app makes):
 
-Structure verified against the scrapling docs (spiders/sessions.html and
-fetching/stealthy.html): configure_sessions + manager.add, requests routed
-with sid="stealth", and per-request page_action callbacks.
+1. Lists the WHOLE recent window: `voyagerJobsDashJobCards` filtered to
+   `timePostedRange` r3600, paged until the collected IDs reach the reported
+   total. LinkedIn buckets r3600 by clock hour (it covers everything since the
+   start of the previous hour, 60-120 minutes), so a job stays listed for
+   20-40 runs: a failed run, or an hour of them, loses nothing. Order inside
+   the window does not matter (sortBy=DD is only roughly sorted).
+2. Fetches one full posting record per unseen ID: title, description,
+   company (+ industry and description), location, job type, workplace and
+   listing times.
+
+Known IDs report their current listing time from the list itself (repost
+detection, core/db.record_listings): no extra requests.
+
+Guardrails (the API is private and can change without notice): LinkedIn
+answers HTTP 200 even for a retired decoration, so a status code proves
+nothing. Every response is checked for the fields we use (`search_structure`,
+`detail_content`), the window must be complete (`window_complete`), still
+time-filtered (`window_filter`) and carry listing times (`listing_times`),
+and a posting record must be the job we asked for. Request templates live in
+markup/linkedin/selectors.json ("api"): bind-mounted, so a new decoration
+version is a file edit, not a rebuild. A posting record that keeps failing is
+saved from its list card before it can leave the window.
+
+Verified live 2026-10-23/24 on a copy of the production profile: 10 rounds x 3
+minutes collected == total every round, new jobs listed 2-7 minutes after
+listedAt, 9/9 of the guest search's last-hour jobs inside our window.
 """
 
-import logging
 import asyncio
+import json
+import logging
 import random
 import re
 import time
-from datetime import datetime, timedelta
-from urllib.parse import urlsplit
+from datetime import datetime
+from urllib.parse import parse_qs, urlsplit
 
-from scrapling import Selector
 from scrapling.fetchers import AsyncStealthySession
 from scrapling.spiders import Request, Response, Spider
 
-from config import (LINKEDIN_SEARCH_URL, LINKEDIN_SEARCH_RECOVERY_ATTEMPTS,
-                    LINKEDIN_SEARCH_RECOVERY_TIMEOUT_SECONDS, LINKEDIN_SLOW_ASSET_WAIT_SECONDS,
-                    LINKEDIN_DETAIL_RECOVERY_TIMEOUT_SECONDS,
-                    LINKEDIN_NAVIGATION_TIMEOUT_SECONDS,
-                    LINKEDIN_NAVIGATION_RETRY_DELAY_SECONDS)
-from core import clock, db, markup
+from config import (LINKEDIN_SEARCH_URL, LINKEDIN_MAX_DETAILS_PER_RUN, LINKEDIN_MAX_WINDOW_PAGES,
+                    LINKEDIN_NAVIGATION_TIMEOUT_SECONDS, LINKEDIN_NAVIGATION_RETRY_DELAY_SECONDS)
+from core import clock, db, timing
 from core.browser import patch_no_load_wait
 from core.browser_diagnostics import BrowserDiagnostics
 from core.scrape_health import ScrapeHealth
@@ -34,248 +56,183 @@ from core.log import configure_spider_logging
 
 logger = logging.getLogger(__name__)
 
-_DETAIL_TIMEOUT = 8_000
-# A clicked job's API record normally lands ~0.5s after the click and the
-# workplace type ~0.9s. Past the first wait the panel DOM path runs its own
-# hydration waits and still switches to the record if it lands meanwhile.
-_API_DETAIL_WAIT = 0.6
-_API_EXTRAS_WAIT = 0.6
-# LinkedIn renders 25 cards per search page. The list loads top-first and
-# appends the rest while scrolled: snapshots caught 7 of 25 (positions 0-6).
-_FULL_PAGE = 25
-# URL paths that mean "not a signed-in session" on a search navigation.
+# URL paths that mean "not a signed-in session" (landing page or API redirect).
 _SIGNED_OUT_PATHS = ("/login", "/checkpoint", "/authwall", "/security-verification", "/uas/login")
-# On a slow link the other 18 cards arrive in ONE jump 11-21s after the
-# scroll (Oct 9), so a still count only counts as settled while no LinkedIn
-# data request is in flight; the cap bounds short pages.
-_SETTLE_SECONDS = 25
-_STABLE_SECONDS = 1.5
-# Scrolls the card's nearest scrollable ancestor (step px, or to the bottom).
-# Structural on purpose: LinkedIn's list scroller has only obfuscated class
-# names, and the named `.scaffold-layout__list` does not scroll once CSS
-# loads (overflow visible), so scrolling it was a no-op (7 of 25 cards, Oct 9).
-_SCROLL_RESULTS_JS = """(card, step) => {
-  let el = card;
-  while ((el = el.parentElement)) {
-    const overflow = getComputedStyle(el).overflowY;
-    if ((overflow === 'auto' || overflow === 'scroll') && el.scrollHeight > el.clientHeight) break;
+_CARD_URN = re.compile(r"^urn:li:fsd_jobPostingCard:\((\d+),")
+# A job stays in the r3600 window for at least 60 minutes (the hour bucket)
+# and shows up 2-7 minutes after its listing time. A posting record that is
+# still failing 45 minutes after listing is saved from its card instead.
+_GIVE_UP_DETAIL_MINUTES = 45
+# Cards listed longer ago than this mean the time filter no longer applies.
+_WINDOW_MAX_AGE_HOURS = 3
+_API_TIMEOUT_MS = 15_000
+
+# In-page fetch: the request goes out from LinkedIn's own page with the
+# session's cookies, exactly like the web app's voyager calls. Never raises:
+# a network error or timeout comes back as status 0.
+_FETCH_JS = """async ([url, csrf, timeoutMs]) => {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, {credentials: 'include', signal: ctrl.signal, headers: {
+      'csrf-token': csrf, 'x-restli-protocol-version': '2.0.0',
+      'accept': 'application/vnd.linkedin.normalized+json+2.1', 'x-li-lang': 'en_US'}});
+    return {status: r.status, url: r.url, body: await r.text()};
+  } catch (e) {
+    return {status: 0, url: '', body: String((e && e.name) || e)};
+  } finally {
+    clearTimeout(timer);
   }
-  el = el || document.scrollingElement;
-  el.scrollTop = step ? el.scrollTop + step : el.scrollHeight;
-  return el.scrollTop;
 }"""
 
-_TIME_DELTAS = {
-    "minute": lambda v: timedelta(minutes=v),
-    "hour": lambda v: timedelta(hours=v),
-    "day": lambda v: timedelta(days=v),
-    "week": lambda v: timedelta(weeks=v),
-    "month": lambda v: timedelta(days=v * 30),
-}
+
+class ApiShapeError(ValueError):
+    """A 200 response without the fields we rely on: LinkedIn changed the API."""
 
 
-_FRESH_AGE = re.compile(r"(\d+)\s+(minute|hour)s?\s+ago")
-
-
-def _listed_at(text: str) -> str | None:
-    """A card's "N minutes/hours ago" as local wall time, else None.
-
-    Repost detection only: a repost is fresh, and day/week ages are too coarse
-    to compare with the stored posting time. No fallback to "now"."""
-    match = _FRESH_AGE.search(text or "")
-    if not match:
+def _wall(ms) -> str | None:
+    """Epoch milliseconds -> local wall time (the posted_at format), else None."""
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OverflowError, OSError):
         return None
-    value, unit = int(match.group(1)), match.group(2)
-    return (datetime.now() - _TIME_DELTAS[unit](value)).strftime("%Y-%m-%d %H:%M")
 
 
-def _cards_from_api(body: dict) -> dict[str, dict]:
-    """Job id -> {"listed_at", "reposted"} from LinkedIn's job-cards API JSON.
+def _text(value) -> str:
+    """A voyager TextViewModel's text (or a plain string), stripped."""
+    if isinstance(value, dict):
+        value = value.get("text")
+    return value.strip() if isinstance(value, str) else ""
 
-    The search list is filled from one voyager response (25 cards). Its card
-    entities carry `jobPostingUrn` and `footerItems` [{type: LISTED_DATE,
-    timeAt: epoch ms}], the posting entities LinkedIn's own `repostedJob`
-    flag. The rendered cards no longer show a listing time at all (Oct 9:
-    0 of 24 read), so this is the only per-card time. listed_at is local
-    wall time (the posted_at format). Anything unexpected is skipped.
+
+def _search_filters(url: str = LINKEDIN_SEARCH_URL) -> dict:
+    """geoId/distance of the configured search page (one source of truth)."""
+    query = parse_qs(urlsplit(url).query)
+    return {"geo_id": (query.get("geoId") or ["106155005"])[0],
+            "distance": (query.get("distance") or ["25"])[0]}
+
+
+def _parse_cards(body) -> dict:
+    """One job-cards page -> {"total", "ids", "unidentified", "cards"}.
+
+    `ids` keep the response order. `cards` maps job id -> {"title",
+    "company", "location", "listed_ms", "listed_at", "reposted"} for the
+    cards this decoration describes (any field may be missing). Raises
+    ApiShapeError when the page itself is not the shape we read.
     """
-    cards: dict[str, dict] = {}
-    for entity in (body or {}).get("included") or []:
-        if not isinstance(entity, dict):
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, dict):
+        raise ApiShapeError("the response has no data object")
+    paging, elements = data.get("paging"), data.get("elements")
+    total = paging.get("total") if isinstance(paging, dict) else None
+    if not isinstance(total, int) or not isinstance(elements, list):
+        raise ApiShapeError("expected data.paging.total and data.elements; data has keys "
+                            + ", ".join(sorted(map(str, data))[:12]))
+    ids, urns, unidentified = [], {}, 0
+    for element in elements:
+        union = element.get("jobCardUnion") if isinstance(element, dict) else None
+        urn = union.get("*jobPostingCard") if isinstance(union, dict) else None
+        match = _CARD_URN.match(urn or "")
+        if not match:
+            unidentified += 1
             continue
-        urn = entity.get("jobPostingUrn") or ""
-        if urn.startswith("urn:li:fsd_jobPosting:"):
-            for item in entity.get("footerItems") or []:
-                if isinstance(item, dict) and item.get("type") == "LISTED_DATE" and item.get("timeAt"):
-                    try:
-                        listed = datetime.fromtimestamp(int(item["timeAt"]) / 1000).strftime("%Y-%m-%d %H:%M")
-                    except (TypeError, ValueError, OverflowError, OSError):
-                        continue
-                    cards.setdefault(urn.rsplit(":", 1)[1], {})["listed_at"] = listed
-        urn = entity.get("entityUrn") or ""
-        if urn.startswith("urn:li:fsd_jobPosting:") and "repostedJob" in entity:
-            cards.setdefault(urn.rsplit(":", 1)[1], {})["reposted"] = bool(entity["repostedJob"])
-    return cards
-
-
-# Prefixes of the voyager entities a clicked job's responses carry.
-_NAMED_ENTITIES = ("urn:li:fsd_geo:", "urn:li:fsd_employmentStatus:", "urn:li:fsd_workplaceType:",
-                   "urn:li:fsd_industryV2:")
-
-
-def _merge_job_entities(store: dict, body: dict) -> None:
-    """Fold a clicked job's voyager responses into store {"jobs", "names"}.
-
-    Clicking a card makes LinkedIn fetch the job by ID: the JobPosting record
-    (voyagerJobsDashJobPostings, ~0.45s) has title, full description.text,
-    company name, listedAt/originalListedAt, repostedJob and references to
-    its location, employment status and industries; the TOP_CARD section
-    (~0.9s) adds the workplace type. Referenced entities (geo, employment
-    status, workplace type, industry) arrive in the same `included` lists
-    and are kept by URN. Unknown shapes are skipped, never raised.
-    """
-    for entity in (body or {}).get("included") or []:
+        ids.append(match.group(1))
+        urns[urn] = match.group(1)
+    cards: dict[str, dict] = {}
+    reposted: dict[str, bool] = {}
+    for entity in body.get("included") or []:
         if not isinstance(entity, dict):
             continue
         urn = str(entity.get("entityUrn") or "")
-        if urn.startswith("urn:li:fsd_jobPosting:"):
-            job = store["jobs"].setdefault(urn.rsplit(":", 1)[1], {})
-            description = entity.get("description")
-            if isinstance(description, dict) and description.get("text"):
-                job["description"] = description["text"]
-            company = entity.get("companyDetails")
-            if isinstance(company, dict) and company.get("name"):
-                job["company"] = company["name"]
-            for key in ("title", "listedAt", "originalListedAt", "repostedJob", "*employmentStatus", "*location"):
-                if entity.get(key) not in (None, ""):
-                    job[key] = entity[key]
-            for key in ("*industryV2Taxonomy", "*jobWorkplaceTypes", "*workplaceTypesResolutionResults"):
-                if isinstance(entity.get(key), list) and entity[key]:
-                    job[key] = list(entity[key])
-        elif urn.startswith(_NAMED_ENTITIES):
-            name = entity.get("defaultLocalizedName") or entity.get("localizedName") or entity.get("name")
-            if name:
-                store["names"][urn] = name
+        if urn in urns:
+            card = cards.setdefault(urns[urn], {})
+            card["title"] = _text(entity.get("jobPostingTitle")) or _text(entity.get("title"))
+            card["company"] = _text(entity.get("primaryDescription"))
+            card["location"] = _text(entity.get("secondaryDescription"))
+            for item in entity.get("footerItems") or []:
+                if isinstance(item, dict) and item.get("type") == "LISTED_DATE" and _wall(item.get("timeAt")):
+                    card["listed_ms"] = int(item["timeAt"])
+                    card["listed_at"] = _wall(item["timeAt"])
+        elif urn.startswith("urn:li:fsd_jobPosting:") and isinstance(entity.get("repostedJob"), bool):
+            reposted[urn.rsplit(":", 1)[1]] = entity["repostedJob"]
+    for job_id, flag in reposted.items():
+        if job_id in cards:
+            cards[job_id]["reposted"] = flag
+    return {"total": total, "ids": ids, "unidentified": unidentified, "cards": cards}
 
 
-def _api_detail(store: dict, job_id: str) -> dict | None:
-    """The clicked job's fields from its API records, or None without a description."""
-    job = store["jobs"].get(str(job_id)) or {}
-    if not job.get("description"):
-        return None
-    names = store["names"]
-    def resolve(refs):
-        return ", ".join(dict.fromkeys(names[ref] for ref in refs or [] if ref in names)) or None
-    def wall(ms):
-        try:
-            return datetime.fromtimestamp(int(ms) / 1000).strftime("%Y-%m-%d %H:%M")
-        except (TypeError, ValueError, OverflowError, OSError):
-            return None
-    return {
-        "title": job.get("title") or "",
-        "company": job.get("company") or "",
-        "description": job["description"].strip(),
-        "detail_location": names.get(job.get("*location")),
-        "job_type": names.get(job.get("*employmentStatus")),
-        "workplace": resolve(job.get("*jobWorkplaceTypes") or job.get("*workplaceTypesResolutionResults")),
-        "industry": resolve(job.get("*industryV2Taxonomy")),
-        "listed_at": wall(job.get("listedAt")),
-        "original_listed_at": wall(job.get("originalListedAt")),
-        "reposted": job.get("repostedJob"),
-    }
+def _job_from_posting(body, job_id: str, card: dict) -> tuple[dict | None, str]:
+    """A full posting record (WebFullJobPosting) -> (job, problem).
 
-
-def _parse_linkedin_time(time_str: str) -> str:
-    if not time_str:
-        return datetime.now().strftime("%Y-%m-%d %H:%M")
-    match = re.search(r"(\d+)\s+(minute|hour|day|week|month)", time_str)
-    if not match:
-        return datetime.now().strftime("%Y-%m-%d %H:%M")
-    value, unit = int(match.group(1)), match.group(2)
-    return (datetime.now() - _TIME_DELTAS[unit](value)).strftime("%Y-%m-%d %H:%M")
-
-
-def _text(sel: Selector, css: str, separator: str = "") -> str:
-    el = sel.css(css).first
-    if not el:
-        return ""
-    text = el.get_all_text(separator=separator) if separator else el.get_all_text()
-    return (text or "").strip()
-
-
-# Pill values LinkedIn renders in the fit-preferences row. Stored raw in
-# extra; normalization to the da_guide enums happens at extraction time.
-_WORKPLACE_PILLS = {"on-site", "on site", "remote", "hybrid"}
-_JOB_TYPE_PILLS = {"full-time", "part-time", "contract", "temporary",
-                   "internship", "freelance", "volunteer", "other"}
-# Segments of the detail header that are NOT the location.
-_HEADER_NOISE = re.compile(
-    r"^(·|applicants?|no response insights.*|school alum.*)$"
-    r"|ago|minute|hour|day|week|month|year|applicant|hiring|promoted",
-    re.I,
-)
-
-
-def _parse_detail_header(header_text: str, pill_texts: list) -> dict:
-    """Split the detail top-card header into location/workplace/job_type.
-
-    header_text is the tertiary-description container rendered with "|"
-    separators, e.g. "Cairo, Egypt|·|6 minutes ago|·|0 applicants".
-    pill_texts are the fit-preferences buttons, e.g. ["On-site",
-    "Full-time"]. Missing values come back as "".
+    job is None with a problem when the record is not usable: another job's
+    ID, or no title/description (the decoration changed). `card` fills what
+    the record lacks. state is in extra["linkedin_state"] (LISTED,
+    SUSPENDED, CLOSED...).
     """
-    location, workplace, job_type = "", "", ""
-    for part in (p.strip(" \t\r\n\xa0") for p in header_text.split("|")):
-        if not part or part == "·":
-            continue
-        if _HEADER_NOISE.search(part):
-            continue
-        if not location:
-            location = part
-    for pill in pill_texts:
-        key = pill.strip().lower()
-        if not workplace and key in _WORKPLACE_PILLS:
-            workplace = pill.strip()
-        elif not job_type and key in _JOB_TYPE_PILLS:
-            job_type = pill.strip()
-    return {"detail_location": location, "workplace": workplace,
-            "job_type": job_type}
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, dict) or not data:
+        return None, "the record has no data object"
+    record_id = str(data.get("jobPostingId") or str(data.get("entityUrn") or "").rsplit(":", 1)[-1])
+    if record_id != str(job_id):
+        return None, f"the record is for job {record_id or '?'}, not {job_id}"
+    description = data.get("description")
+    description = description.get("text") if isinstance(description, dict) else None
+    title = data.get("title") if isinstance(data.get("title"), str) else ""
+    if not (title or "").strip() or not (description or "").strip():
+        return None, (f"title present={bool((title or '').strip())}, description present="
+                      f"{bool((description or '').strip())}; record keys: {', '.join(sorted(data)[:15])}")
+    included = {e.get("entityUrn"): e for e in body.get("included") or [] if isinstance(e, dict)}
+    details = data.get("companyDetails") if isinstance(data.get("companyDetails"), dict) else {}
+    company = included.get(details.get("company") or details.get("*companyResolutionResult")) or {}
+    names = [included.get(urn, {}).get("localizedName") for urn in data.get("workplaceTypes") or []]
+    employment = included.get(data.get("employmentStatus")) or {}
+    industries = [str(name) for name in company.get("industries") or [] if name]
+    extra = {
+        "detail_source": "jobs_api",
+        "detail_location": data.get("formattedLocation") or card.get("location") or "",
+        "workplace": ", ".join(dict.fromkeys(name for name in names if name)),
+        "job_type": data.get("formattedEmploymentStatus") or employment.get("localizedName") or "",
+        "company_industry": ", ".join(industries),
+        "company_description": re.sub(r"\s+", " ", str(company.get("description") or "")).strip(),
+        "original_listed_at": _wall(data.get("originalListedAt")),
+        "linkedin_reposted": card.get("reposted"),
+        "linkedin_state": data.get("jobState"),
+    }
+    job = {
+        "source": "linkedin",
+        "external_id": str(job_id),
+        "title": title.strip(),
+        "company": (company.get("name") or details.get("companyName") or card.get("company") or "").strip(),
+        "posted_at": _wall(data.get("listedAt")) or card.get("listed_at") or datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "description": description.strip(),
+        "link": f"https://www.linkedin.com/jobs/view/{job_id}/",
+        "extra": {key: value for key, value in extra.items() if value not in (None, "")},
+        "scraped_at": clock.now_str(),  # UTC; posted_at stays local
+    }
+    return job, ""
 
 
-def _company_metadata(sel: Selector, selectors: dict) -> dict:
-    """Preserve explicit employer context independently of the role's text."""
-    extra = {}
-    if selectors.get("company_industry"):
-        text = _text(sel, selectors["company_industry"], separator="\n")
-        industry = next((line.strip() for line in text.splitlines() if line.strip()), "")
-        if industry:
-            extra["company_industry"] = industry
-    if selectors.get("company_description"):
-        for element in sel.css(selectors["company_description"]):
-            text = re.sub(r"\s+", " ", element.get_all_text(separator=" ")).strip()
-            text = re.sub(r"\s*(?:…\s*)?show more\s*$", "", text, flags=re.I)
-            if text:
-                extra["company_description"] = text
-                break
-    return extra
+def _job_from_card(job_id: str, card: dict, reason: str) -> dict:
+    """A job from its list card alone (title, company, location, listing time).
 
-
-def _search_failure_detail(html: str, selectors: dict, stage: str, error_type: str) -> str:
-    """Describe the captured DOM without guessing why rendering failed."""
-    if not html:
-        return f"Search failed while {stage} ({error_type}); page content was unavailable."
-    page = Selector(html)
-    cards = len(page.css(selectors["job_card"]))
-    lists = len(page.css(selectors["results_list"]))
-    if page.css(selectors["login_redirect"]):
-        reason = "Sign-in form is present on the search page; check session expiry."
-    elif (not cards and not lists and selectors.get("loading_shell")
-          and page.css(selectors["loading_shell"])):
-        reason = ("LinkedIn is stuck on its startup/loading screen; no job cards or results list rendered. "
-                  "The snapshot does not establish the cause of the loading failure.")
-    else:
-        reason = f"Search DOM contains {cards} cards and {lists} results lists; check loading or selector changes."
-    return f"{reason} Failed while {stage} ({error_type})."
+    Used when the posting record keeps failing and the job is about to leave
+    the window, or when the record API changed: a delivered job without its
+    description beats a lost one. The classifier sees detail_status.
+    """
+    return {
+        "source": "linkedin",
+        "external_id": str(job_id),
+        "title": card.get("title") or "",
+        "company": card.get("company") or "",
+        "posted_at": card.get("listed_at") or datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "description": "",
+        "link": f"https://www.linkedin.com/jobs/view/{job_id}/",
+        "extra": {key: value for key, value in {
+            "detail_source": "cards_api", "detail_status": "fetch_failed", "detail_error": reason[:200],
+            "detail_location": card.get("location"), "linkedin_reposted": card.get("reposted"),
+        }.items() if value not in (None, "")},
+        "scraped_at": clock.now_str(),
+    }
 
 
 class LinkedInJobSpider(Spider):
@@ -283,25 +240,17 @@ class LinkedInJobSpider(Spider):
 
     def __init__(self, selectors: dict, cdp_url: str, *args, **kwargs):
         self.sel = selectors
+        self.api = selectors["api"]
         self.cdp_url = cdp_url
-        self.seen_ids: set[str] = set()  # IDs discovered during this run only
-
+        self.seen_ids: set[str] = set()  # IDs saved during this run only
         self._page_jobs: list[dict] = []
         self.listings: dict[str, str] = {}  # known job id -> current listing time
         self.on_job = None  # board.save_now: persist each job as soon as it is scraped
-        # Not signed in on the search page itself: the board runs its login
-        # check and retries (no health alert, the login flow owns that).
+        # Not signed in (landing page, or an API 401/redirect): the board runs
+        # its login check and retries (no health alert, the login flow owns that).
         self._needs_login: bool = False
         self._signed_in: bool = False  # the search page proved the session
-        # Job id -> {"listed_at", "reposted"} from the job-cards API response.
-        self._api_cards: dict[str, dict] = {}
-        self._api_reads: list = []
-        # Clicked jobs' API records (see _merge_job_entities).
-        self._job_api: dict = {"jobs": {}, "names": {}}
-        self._api_details = 0
-        self._api_misses = 0
-        self._login_redirect: bool = False
-        self._detail_failures: dict[str, str] = {}
+        self._csrf = ""
         self.health = ScrapeHealth("linkedin")
         self.diagnostics = BrowserDiagnostics({"www.linkedin.com", "linkedin.com", "static.licdn.com"})
 
@@ -315,9 +264,7 @@ class LinkedInJobSpider(Spider):
                 cdp_url=self.cdp_url,
                 # disable_resources=False: scrapling's resource blocking installs
                 # page.route(), and Playwright disables Chrome's HTTP cache on any
-                # intercepted page, so LinkedIn's ~3 MB app bundle downloaded on
-                # EVERY run; on a slow link the app never booted (Oct 9: 24-59s,
-                # cards never shown). Cached, the page needs ~0.5 MB and ~3s.
+                # intercepted page (Gotchas #11).
                 disable_resources=False,
                 timeout=LINKEDIN_NAVIGATION_TIMEOUT_SECONDS * 1000,
                 retries=2,
@@ -327,85 +274,18 @@ class LinkedInJobSpider(Spider):
         )
 
     async def setup_search_page(self, page):
+        # Document commit is enough: the API calls need the page's origin and
+        # cookies, not LinkedIn's app (a slow app-bundle download no longer
+        # holds the run, Gotchas #11).
         await patch_no_load_wait(page, selector_readiness=True)
         self.diagnostics.reset()
         self.diagnostics.attach(page)
-        # Tabs are reused across fetches: attach the cards listener once per page.
-        if getattr(page, "_rtjobs_cards_spider", None) is not self:
-            page._rtjobs_cards_spider = self
-            page.on("response", self._on_response)
-
-    def _on_response(self, response):
-        url = response.url or ""
-        if self.sel["search"].get("cards_api", "voyagerJobsDashJobCards") in url:
-            self._api_reads.append(asyncio.ensure_future(self._read_cards(response)))
-        elif "/voyager/api/" in url:
-            # Every voyager response, not only ones naming the job: LinkedIn
-            # prefetches details of nearby cards and then skips the request on
-            # the click (staging Oct 9: 2 of 6 clicks had no own request).
-            self._api_reads.append(asyncio.ensure_future(self._read_job_api(response)))
-
-    async def _read_job_api(self, response):
-        try:
-            if "json" not in (response.headers.get("content-type") or ""):
-                return
-            _merge_job_entities(self._job_api, await response.json())
-        except Exception as exc:  # never fails the scan; the panel DOM still works
-            logger.debug("[linkedin] Job API response unreadable: %s", type(exc).__name__)
-
-    async def _await_api_detail(self, job_id: str, wait: float = 0.0) -> dict | None:
-        """The clicked job's API data: the record with its description (up to
-        `wait` seconds), then a short wait for the workplace type, which comes
-        with the top card a moment later. None = not (yet) available."""
-        # Two misses and no hit this run: the API changed or is not used;
-        # stop paying the wait on every remaining card.
-        if self._api_misses >= 2 and not self._api_details:
-            wait = 0
-        deadline = time.monotonic() + wait
-        detail = _api_detail(self._job_api, job_id)
-        while detail is None and time.monotonic() < deadline:
-            await asyncio.sleep(0.1)
-            detail = _api_detail(self._job_api, job_id)
-        if detail is None:
-            return None
-        deadline = time.monotonic() + _API_EXTRAS_WAIT
-        while not detail["workplace"] and time.monotonic() < deadline:
-            await asyncio.sleep(0.1)
-            detail = _api_detail(self._job_api, job_id)
-        return detail
-
-    async def _read_cards(self, response):
-        try:
-            self._api_cards.update(_cards_from_api(await response.json()))
-        except Exception as exc:  # never fails the scan; DOM data still works
-            logger.debug("[linkedin] Job-cards API unreadable: %s", type(exc).__name__)
-
-    async def _api_cards_ready(self, timeout: float = 2.0) -> dict[str, dict]:
-        """The cards API data, once in-flight reads finish (bounded)."""
-        pending = [task for task in self._api_reads if not task.done()]
-        if pending:
-            await asyncio.wait(pending, timeout=timeout)
-        return self._api_cards
 
     async def on_error(self, request: Request, error: Exception):
-        # Called after scrapling exhausts its three navigation attempts. This
-        # also covers a later pagination request failing after earlier success.
+        # Called after scrapling exhausts its navigation attempts.
         self.diagnostics.navigation_error(error)
         self.health.check("search_fetch", False,
                           "Search navigation failed after retries. Evidence: " + self.diagnostics.summary())
-
-    def _access_blocked(self, page, html: str) -> bool:
-        """Login/checkpoints and explicit access/rate limits need a later run.
-
-        A login/checkpoint page also sets _needs_login: the board then runs
-        its login check (which handles checkpoints) instead of alerting.
-        """
-        path = urlsplit(page.url or "").path.lower()
-        if (any(part in path for part in _SIGNED_OUT_PATHS)
-                or (html and Selector(html).css(self.sel["search"]["login_redirect"]))):
-            self._needs_login = True
-            return True
-        return self.diagnostics.access_status in (401, 403, 429)
 
     async def _signed_out(self, page) -> bool:
         """The search page is not a signed-in session: a login/checkpoint URL,
@@ -420,108 +300,63 @@ class LinkedInJobSpider(Spider):
             return True
         return not any(c.get("name") == "li_at" and c.get("value") for c in cookies)
 
-    async def _wait_for_search(self, page) -> bool:
-        """Retry a stalled load once; keep terminal evidence only if it persists.
+    async def _csrf_token(self, page) -> str:
+        """LinkedIn's CSRF token for API calls: the JSESSIONID cookie, unquoted."""
+        try:
+            cookies = await page.context.cookies("https://www.linkedin.com")
+        except Exception:
+            return ""
+        return next((str(c.get("value") or "").strip('"') for c in cookies if c.get("name") == "JSESSIONID"), "")
 
-        A timeout while LinkedIn's app bundle is still downloading gets ONE
-        longer wait on the same page instead of a reload (which would restart
-        the download); it does not use up a recovery attempt.
+    async def _api(self, page, url: str) -> tuple[int, dict | None, str]:
+        """GET a voyager URL from inside the page -> (status, json, problem).
+
+        Status 0 = no response (network error, timeout, the page navigated
+        away). Network errors and 5xx get one retry; 401/403/429 never do
+        (they need a person or time, and retrying can make them worse). A
+        response that ended on a sign-in/checkpoint URL counts as 401.
         """
-        target = page.url
-        stage = "waiting for job cards"
-        html = ""
-        last_error = "TimeoutError"
-        if self._access_blocked(page, ""):
+        problem = ""
+        for attempt in range(2):
             try:
-                initial_html = await page.content()
-            except Exception:
-                initial_html = ""
-            if self._needs_login:
-                return False
-            detail = "LinkedIn search requires sign-in/checkpoint handling or returned an access/rate-limit error. "
-            self.health.check("search_structure", False, detail + self.diagnostics.summary(), initial_html)
-            return False
-        attempt, extend, extended = 0, False, False
-        while attempt <= LINKEDIN_SEARCH_RECOVERY_ATTEMPTS:
-            if extend:
-                deadline = time.monotonic() + LINKEDIN_SLOW_ASSET_WAIT_SECONDS
-            else:
-                deadline = time.monotonic() + (LINKEDIN_SEARCH_RECOVERY_TIMEOUT_SECONDS if attempt else 30)
-            def remaining_ms():
-                # Playwright treats timeout=0 as unlimited, so always use >=1.
-                return max(1, int((deadline - time.monotonic()) * 1000))
-            if attempt and not extend:
-                logger.info("[linkedin] Retrying stalled search (%s/%s); previous evidence: %s",
-                            attempt, LINKEDIN_SEARCH_RECOVERY_ATTEMPTS, self.diagnostics.summary())
-                self.diagnostics.reset()
-                stage = "reloading search"
-                try:
-                    await page.goto(target, wait_until="commit", timeout=remaining_ms())
-                except Exception as exc:
-                    # A navigation timeout can leave a usable DOM. Spend only
-                    # the remainder of this attempt's deadline checking it.
-                    last_error = type(exc).__name__
-                    self.diagnostics.navigation_error(exc)
-                    logger.warning("[linkedin] Recovery navigation: %s", last_error)
-            extend = False
-            try:
-                if self._access_blocked(page, ""):
-                    stage = "checking LinkedIn access (login/checkpoint or HTTP 401/403/429); no reload attempted"
-                    break
-                stage = "waiting for job cards"
-                await page.wait_for_selector(self.sel["search"]["job_card"], timeout=remaining_ms())
-                # A redirect or access response may arrive while cards hydrate.
-                if self._access_blocked(page, ""):
-                    stage = "checking LinkedIn access (login/checkpoint or HTTP 401/403/429); no reload attempted"
-                    break
-                stage = "scrolling the results list"
-                # One scroll starts the list's lazy load (the job-cards API
-                # call); _settled_cards keeps scrolling until every card is in
-                # and waits while LinkedIn data is still loading. The former
-                # fixed 4 x (1000px + 0.8s) cost 3.2s on every run.
-                await self._scroll_results(page, None, timeout=remaining_ms())
-                if attempt or extended:
-                    logger.info("[linkedin] Search recovered after %s retry%s; continuing normal extraction.",
-                                attempt, " and a slow-asset wait" if extended else "")
-                return True
+                result = await page.evaluate(_FETCH_JS, [url, self._csrf, _API_TIMEOUT_MS])
             except Exception as exc:
-                last_error = type(exc).__name__
-                logger.warning("[linkedin] Search attempt %s failed while %s: %s", attempt + 1, stage, last_error)
+                # The page navigated (e.g. a client-side redirect) while the call
+                # ran; the next document has the same origin and cookies.
+                result, problem = {"status": 0, "url": "", "body": ""}, type(exc).__name__
+            status = int(result.get("status") or 0)
+            if any(part in urlsplit(result.get("url") or "").path.lower() for part in _SIGNED_OUT_PATHS):
+                return 401, None, "redirected to sign-in/checkpoint"
+            if status == 200:
                 try:
-                    html = await page.content()
-                except Exception:
-                    html = ""
-                if self._access_blocked(page, html):
-                    stage = "checking LinkedIn access (login/checkpoint or HTTP 401/403/429); no reload attempted"
-                    break
-                if (not extended and LINKEDIN_SLOW_ASSET_WAIT_SECONDS > 0
-                        and self.diagnostics.still_loading("static.licdn.com script")):
-                    extended = extend = True
-                    logger.info("[linkedin] LinkedIn scripts still downloading (%s) — waiting up to %ss"
-                                " on the same page instead of reloading.",
-                                self.diagnostics.summary(), LINKEDIN_SLOW_ASSET_WAIT_SECONDS)
-                    continue
-            attempt += 1
-        if self._needs_login:
-            return False
-        detail = _search_failure_detail(html, self.sel["search"], stage, last_error)
-        detail += " Evidence: " + self.diagnostics.summary()
-        self.health.check("search_structure", False, detail, html)
-        return False
+                    return 200, json.loads(result.get("body") or ""), ""
+                except ValueError:
+                    return 200, None, "the response is not JSON"
+            if status == 403 and "CSRF" in str(result.get("body") or "") and not attempt:
+                # The session's JSESSIONID changed under us: read it again once.
+                self._csrf = await self._csrf_token(page)
+                continue
+            problem = problem or (f"HTTP {status}" if status else str(result.get("body") or "no response")[:80])
+            if (status and status < 500) or attempt:
+                return status, None, problem
+            await asyncio.sleep(2)
+            problem = ""
+        return 0, None, problem
+
+    def _cards_url(self, start: int) -> str:
+        return self.api["cards_url"].format(start=start, count=self.api.get("page_size", 25),
+                                            window=self.api.get("window", "r3600"), **_search_filters())
 
     async def start_requests(self):
         yield Request(
             LINKEDIN_SEARCH_URL,
             callback=self.parse,
             sid="stealth",
-            page_action=self.deep_scan_page,
+            page_action=self.scan_window,
         )
 
-    async def deep_scan_page(self, page):
-        from core import timing
-
+    async def scan_window(self, page):
         self._page_jobs = []
-        self._detail_failures = {}
         if await self._signed_out(page):
             self._needs_login = True
             logger.info("[linkedin] Not signed in on the search page (%s) — the board will run its login check.",
@@ -529,366 +364,163 @@ class LinkedInJobSpider(Spider):
             return
         self._signed_in = True
         self.health.check("search_fetch", True)
-        # Whole search page: hydration wait, scroll, card clicks, detail panels.
         with timing.stage("linkedin", "search_page", lambda: {"new_jobs": len(self._page_jobs)}):
-            if not await self._wait_for_search(page):
+            self._csrf = await self._csrf_token(page)
+            if not self._csrf:
+                self.health.check("search_structure", False,
+                                  "The signed-in page has no JSESSIONID cookie, which LinkedIn's API needs as its CSRF token.")
                 return
-
-            cards = await self._settled_cards(page)
-            card_ids = [(card, await card.get_attribute(self.sel["search"]["job_id_attr"]))
-                        for card in cards]
-            usable = sum(bool(key) for _, key in card_ids)
-            if not usable:
-                await self.health.page_failure("search_structure", f"Found {len(cards)} cards but no usable job IDs.", page)
+            window = await self._list_window(page)
+            if window is None:
                 return
-            self.health.check("search_structure", True)
-            # Only page 1 is read, so an incomplete list silently leaves the
-            # lower cards unchecked until a later run; never observed so far.
-            self.health.check("full_page", len(cards) >= _FULL_PAGE,
-                              f"Only {len(cards)} of {_FULL_PAGE} search cards rendered after waiting; "
-                              "lower cards were not checked this run.")
-            self.health.check("card_ids", usable == len(cards),
-                              f"{len(cards) - usable} of {len(cards)} search cards had no job ID and were "
-                              "skipped (layout change or non-job list items).")
-            stored_ids = db.seen_ids_for("linkedin", (key for _, key in card_ids))
-            known_ids = self.seen_ids | stored_ids
-            api_cards = await self._api_cards_ready()
-            listed = {key: api_cards[key]["listed_at"] for key in stored_ids
-                      if api_cards.get(key, {}).get("listed_at")}
-            if not listed:  # API not seen: fall back to card text
-                listed = await self._known_listings(page, stored_ids)
-            self.listings.update(listed)
-            flagged = sum(1 for key in stored_ids if api_cards.get(key, {}).get("reposted"))
-            logger.info("[linkedin] Listing times read for %s of %s known cards (repost detection; %s);"
-                        " LinkedIn flags %s of them as reposted.",
-                        len(listed), len(stored_ids), "cards API" if api_cards else "card text", flagged)
+            ids, cards = window
+            stored = db.seen_ids_for("linkedin", ids)
+            # Known jobs: their current listing time feeds repost detection.
+            self.listings.update({key: cards[key]["listed_at"] for key in stored if cards.get(key, {}).get("listed_at")})
+            new = [key for key in ids if key not in stored and key not in self.seen_ids]
+            flagged = sum(1 for key in stored if cards.get(key, {}).get("reposted"))
+            logger.info("[linkedin] Window: %s jobs, %s new; listing times for %s of %s known (LinkedIn flags %s"
+                        " as reposted).", len(ids), len(new), len(self.listings), len(stored), flagged)
+            if new:
+                await self._fetch_new(page, new, cards)
 
-            # Every unknown card on the page, wherever it sits: promoted or
-            # reposted old cards never hide newer ones (no pagination).
-            jobs_to_scrape_now = [(card, job_id) for card, job_id in card_ids
-                                  if job_id and str(job_id) not in known_ids]
+    async def _list_window(self, page) -> tuple[list[str], dict] | None:
+        """Every job ID in the recent window, with its card; None on failure.
 
-            logger.info(
-                f"[info] Found {len(jobs_to_scrape_now)} new jobs and"
-                f" {usable - len(jobs_to_scrape_now)} old jobs on this page"
-                f" ({len(cards)} cards, {len(cards) - usable} without ID)."
-            )
-
-            for card, job_id in jobs_to_scrape_now:
-                if self._login_redirect or self._needs_login:
-                    break  # session gone: every further card would wait out its timeouts
-                pause = random.uniform(2.0, 4.0)  # human-like pause
-                timing.record("linkedin", "human_delay", pause, {"card": str(job_id)})
-                await asyncio.sleep(pause)
-                with timing.stage("linkedin", "detail_panel", {"job_id": str(job_id)}):
-                    job = await self._scrape_card(page, card, job_id)
-                if job:
-                    api_card = self._api_cards.get(str(job_id), {})
-                    if api_card.get("listed_at"):
-                        # Exact listing time instead of the panel's rounded "N hours ago".
-                        job["posted_at"] = api_card["listed_at"]
-                        job.setdefault("extra", {})["posted_at_source"] = "cards_api"
-                    if "reposted" in api_card:
-                        job.setdefault("extra", {})["linkedin_reposted"] = api_card["reposted"]
-                    self._page_jobs.append(job)
-                    self.seen_ids.add(str(job_id))
-                    if self.on_job:
-                        self.on_job(job)
-
-        if jobs_to_scrape_now:
-            logger.info("[linkedin] Detail data from the job API for %s of %s new jobs (rest: panel DOM).",
-                        self._api_details, len(jobs_to_scrape_now))
-            failures = len(jobs_to_scrape_now) - len(self._page_jobs)
-            if failures:
-                reasons = "; ".join(f"{key}: {value}" for key, value in list(self._detail_failures.items())[:3])
-                await self.health.page_failure("detail_fetch",
-                    f"{failures}/{len(jobs_to_scrape_now)} new cards produced no job after recovery. "
-                    f"{reasons}. Evidence: {self.diagnostics.summary()}", page)
-            else:
-                self.health.check("detail_fetch", True)
-            self.health.job_fields(self._page_jobs)
-
-        # Suspicious empty page or login redirect -> keep markup for debugging
-        if (not jobs_to_scrape_now and len(cards) == 0) or self._login_redirect:
-            html = await page.content()
-            kind = "search_redirect" if self._login_redirect else "search_empty"
-            markup.save_snapshot("linkedin", kind, html)
-
-    async def _known_listings(self, page, known: set[str]) -> dict[str, str]:
-        """Current listing time of already-known cards, for repost detection.
-
-        One evaluate call reads every card's "N minutes ago" (a repost shows
-        its new time there). Never fails the scan; occluded cards without a
-        rendered time are simply skipped.
+        Pages until the IDs collected reach the first page's total. A job
+        added while paging shifts later pages by one (a repeat, not a gap); a
+        job removed meanwhile can hide one other job until the next run.
         """
-        try:
-            pairs = await page.locator(self.sel["search"]["job_card"]).evaluate_all(
-                "(cards, [attr, timeCss]) => cards.map(card => [card.getAttribute(attr),"
-                " (card.querySelector(timeCss) || {}).textContent || ''])",
-                [self.sel["search"]["job_id_attr"], self.sel["search"]["card_listed"]])
-        except Exception as exc:
-            logger.debug("[linkedin] Card listing times unavailable: %s", type(exc).__name__)
-            return {}
-        listings = {}
-        for job_id, text in pairs or []:
-            listed = _listed_at(text) if job_id and str(job_id) in known else None
-            if listed:
-                listings[str(job_id)] = listed
-        return listings
-
-    async def _scroll_results(self, page, step: int | None, timeout: int = 1000):
-        """Scroll the element that really scrolls the results list."""
-        await page.locator(self.sel["search"]["job_card"]).first.evaluate(
-            _SCROLL_RESULTS_JS, step, timeout=timeout)
-
-    async def _settled_cards(self, page):
-        """Card locators once the list is complete: 25 cards, or a count that
-        stopped growing for 1.5s with no LinkedIn data request in flight (25s
-        cap). Instant when all 25 are present."""
-        cards = page.locator(self.sel["search"]["job_card"])
-        deadline = time.monotonic() + _SETTLE_SECONDS
-        last, changed_at = -1, time.monotonic()
-        while True:
-            count = await cards.count()
-            now = time.monotonic()
-            if count >= _FULL_PAGE or now >= deadline:
-                break
-            if count != last:
-                last, changed_at = count, now
-            elif now - changed_at >= _STABLE_SECONDS and not self.diagnostics.fetching("www.linkedin.com"):
-                break
-            try:  # appending is driven by scrolling the results list
-                await self._scroll_results(page, None)
-            except Exception:
-                pass
-            await asyncio.sleep(0.3)
-        if count < _FULL_PAGE:
-            logger.warning("[linkedin] Search list settled at %s of %s cards.", count, _FULL_PAGE)
-        return await cards.all()
-
-    async def _scrape_card(self, page, card, job_id: str) -> dict | None:
-        try:
-            if not await self._open_card(page, card, job_id):
-                return None
-
-            if (
-                await page.locator(self.sel["search"]["login_redirect"]).count()
-                > 0
-            ):
-                logger.warning("[warn] Redirected to login — session may have expired")
-                self._login_redirect = True
-                return None
-
-            d = self.sel["job_detail"]
-            detail_company_loc = page.locator(d["company"]).first
-            # The click fetched this job by ID; its API record carries the
-            # core fields (keyed by ID, so never the previous card's) and
-            # makes the hydration waits below unnecessary.
-            api = await self._await_api_detail(str(job_id), _API_DETAIL_WAIT)
-            if api is None:
-                # Detail panel HTML exists instantly (skeleton) — poll for
-                # company hydration instead of a fixed sleep. Detail company
-                # often takes 1-3s after click to populate. The API record can
-                # still land meanwhile (slow link): then stop waiting at once.
-                async def settle(seconds):
-                    deadline = time.monotonic() + seconds
-                    while time.monotonic() < deadline:
-                        if _api_detail(self._job_api, str(job_id)):
-                            return True
-                        await asyncio.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
-                    return False
-                # Short initial settle then poll for non-empty company.
-                landed = await settle(random.uniform(0.8, 1.5))
-                for _ in range(0 if landed else 12):  # up to ~6s
-                    try:
-                        if ((await detail_company_loc.text_content()) or "").strip():
-                            break
-                    except Exception:
-                        pass
-                    if await settle(0.5):
-                        landed = True
-                        break
-                # Small extra settle for title/description to finish hydrating.
-                if not landed:
-                    landed = await settle(random.uniform(0.5, 1.0))
-                api = await self._await_api_detail(str(job_id)) if landed else None
-                if api is None:
-                    self._api_misses += 1
-            if api is not None:
-                self._api_details += 1
-                # "About the company" (industry, description) only exists in
-                # the panel; it renders with its own request, ~0.7s after the click.
-                for _ in range(5):
-                    if await page.locator(d["company_industry"]).count():
-                        break
-                    await asyncio.sleep(0.1)
-
-            # Serialize ONLY the detail panel container instead of the whole
-            # page (~15 KB vs ~550 KB per card) — the old full-page
-            # page.content() per job dominated the run's CPU/memory. All
-            # job_detail selectors are descendants of the panel container
-            # (verified against markup/linkedin snapshots). Falls back to
-            # the full page if the panel locator is gone (layout change /
-            # slow hydration).
-            try:
-                html = await page.locator(d["panel"]).first.inner_html()
-            except Exception:
-                html = ""
-            if not html.strip():
-                logger.warning(f"[warn] Panel empty for {job_id} — full page fallback")
-                html = await page.content()
-            sel = Selector(html)
-
-            title = _text(sel, d["title"])
-            company = _text(sel, d["company"])
-            rel_time = _text(sel, d["posted_at"])
-            desc = _text(sel, d["description"], separator="\n")
-            mgr_name = _text(sel, d["hiring_manager_name"])
-            mgr_role = _text(sel, d["hiring_manager_role"])
-
-            # Structured header: location ("Cairo, Egypt · 6 minutes ago")
-            # plus fit-preference pills ("On-site", "Full-time"). Stored
-            # raw in extra; the extractor normalizes to the guide enums.
-            header_text = _text(sel, d.get("detail_header", ""),
-                                separator="|") if d.get("detail_header") else ""
-            pill_texts: list = []
-            if d.get("fit_pills"):
+        ids: list[str] = []
+        cards: dict[str, dict] = {}
+        total, unidentified, calls = None, 0, 0
+        size = int(self.api.get("page_size", 25))
+        with timing.stage("linkedin", "job_list", lambda: {"calls": calls, "total": total, "ids": len(ids)}):
+            for start in range(0, size * LINKEDIN_MAX_WINDOW_PAGES, size):
+                if calls:
+                    await self._pause(0.3, 0.8)
+                status, body, problem = await self._api(page, self._cards_url(start))
+                calls += 1
+                if status == 401:
+                    self._needs_login = True
+                    logger.info("[linkedin] Job list answered 401 (%s) — the board will run its login check.", problem)
+                    return None
+                if body is None:
+                    self.health.check("search_structure", False,
+                                      f"Job list request (start={start}) failed: {problem}. "
+                                      + ("LinkedIn is limiting or restricting access; no retry this run. "
+                                         if status in (403, 429) else "")
+                                      + "Evidence: " + self.diagnostics.summary())
+                    return None
                 try:
-                    for el in sel.css(d["fit_pills"]):
-                        t = (el.get_all_text() or "").strip()
-                        if t:
-                            pill_texts.append(t)
-                except Exception:
-                    pass
-            header = _parse_detail_header(header_text, pill_texts)
-            if api:
-                title = api["title"] or title
-                company = api["company"] or company
-                desc = api["description"] or desc
-                for field in ("detail_location", "workplace", "job_type"):
-                    header[field] = api[field] or header[field]
+                    parsed = _parse_cards(body)
+                except ApiShapeError as exc:
+                    self.health.check("search_structure", False,
+                                      f"Job list API changed: {exc}. Update api.cards_url in markup/linkedin/selectors.json.")
+                    return None
+                total = parsed["total"] if total is None else total
+                unidentified += parsed["unidentified"]
+                fresh = [key for key in parsed["ids"] if key not in cards]
+                for key in parsed["ids"]:
+                    cards.setdefault(key, {}).update(parsed["cards"].get(key, {}))
+                ids += fresh
+                if not parsed["ids"] or len(ids) >= total:
+                    break
+        self.health.check("search_structure", True)
+        self._check_window(ids, cards, total, unidentified, calls)
+        return ids, cards
 
-            # Fallback chain: Selector(html) can be stale vs live DOM,
-            # and detail hydration can still lag. Card subtitle is always
-            # populated (left pane) — use it when detail is empty.
-            if not company:
-                try:
-                    live = ((await detail_company_loc.text_content()) or "").strip()
-                    if live:
-                        company = live
-                except Exception:
-                    pass
-            if not company:
-                try:
-                    card_locator = self.sel["search"].get(
-                        "card_company", ".artdeco-entity-lockup__subtitle"
-                    )
-                    # Primary: the card Handle we clicked
-                    card_text = ""
-                    try:
-                        card_text = (
-                            (await card.locator(card_locator).first.text_content())
-                            or ""
-                        ).strip()
-                    except Exception:
-                        pass
-                    # Fallback: re-query by job_id in case card handle is stale
-                    if not card_text:
-                        try:
-                            alt = page.locator(
-                                f'li[data-occludable-job-id="{job_id}"] {card_locator}'
-                            ).first
-                            card_text = ((await alt.text_content()) or "").strip()
-                        except Exception:
-                            pass
-                    if card_text:
-                        company = card_text
-                except Exception as e:
-                    logger.warning(f"  [warn] card fallback failed for {job_id}: {e}")
+    def _check_window(self, ids: list[str], cards: dict, total: int, unidentified: int, calls: int):
+        """Guardrails on a listed window: complete, time-filtered, with times."""
+        cap = int(self.api.get("page_size", 25)) * LINKEDIN_MAX_WINDOW_PAGES
+        self.health.check("window_complete", len(ids) >= total,
+                          f"Collected {len(ids)} of the {total} jobs LinkedIn reported for the recent window in "
+                          f"{calls} request(s)" + (f" (cap: {cap}; raise LINKEDIN_MAX_WINDOW_PAGES)" if total > cap else "")
+                          + ". The rest are read on later runs while they stay listed.")
+        self.health.check("card_ids", not unidentified,
+                          f"{unidentified} job-list entries had no job ID and were skipped (API change?).")
+        timed = [cards[key]["listed_ms"] for key in ids if cards.get(key, {}).get("listed_ms")]
+        self.health.check("listing_times", not ids or len(timed) * 10 >= len(ids) * 9,
+                          f"Only {len(timed)} of {len(ids)} job-list cards carry a listing time (decoration changed?): "
+                          "repost detection is paused; new jobs still get their time from the posting record.")
+        cutoff = (time.time() - _WINDOW_MAX_AGE_HOURS * 3600) * 1000
+        stale = sum(1 for ms in timed if ms < cutoff)
+        self.health.check("window_filter", stale <= max(2, len(timed) // 10),
+                          f"{stale} of {len(timed)} cards in the 'recent' window were listed over "
+                          f"{_WINDOW_MAX_AGE_HOURS}h ago: LinkedIn may be ignoring the time filter.")
 
-            if not company:
-                # Still empty after fallbacks — keep markup for debugging.
-                snapshot = markup.save_snapshot("linkedin", "company_missing", html)
-                self.health.snapshot = self.health.snapshot or snapshot
-                logger.warning(f"  [warn] Company name not parsed for {job_id}")
+    async def _fetch_new(self, page, new: list[str], cards: dict):
+        """One posting record per new job, oldest listing first (it leaves the
+        window first), capped per run; the rest wait for the next run."""
+        new = sorted(new, key=lambda key: cards.get(key, {}).get("listed_ms") or 0)
+        batch, waiting = new[:LINKEDIN_MAX_DETAILS_PER_RUN], new[LINKEDIN_MAX_DETAILS_PER_RUN:]
+        failures, shape_problems, inactive, stop = {}, {}, [], ""
+        for job_id in batch:
+            card = cards.get(job_id, {})
+            if not stop:
+                await self._pause(0.5, 1.2)
+                with timing.stage("linkedin", "detail_api", {"job_id": job_id}):
+                    status, body, problem = await self._api(page, self.api["posting_url"].format(job_id=job_id))
+                if status == 401:
+                    self._needs_login = True
+                    logger.info("[linkedin] Posting record answered 401 — the board will run its login check.")
+                    break
+                if status == 404:
+                    inactive.append(job_id)  # deleted since it was listed
+                    continue
+                if body is not None:
+                    job, problem = _job_from_posting(body, job_id, card)
+                    if job is None:
+                        shape_problems[job_id] = problem
+                        self._save(_job_from_card(job_id, card, "record unusable: " + problem))
+                        continue
+                    if job["extra"].get("linkedin_state", "LISTED") != "LISTED":
+                        inactive.append(job_id)  # suspended/closed: retried while it stays listed
+                        continue
+                    self._save(job)
+                    continue
+                failures[job_id] = problem
+                if status in (403, 429):
+                    stop = problem  # no further calls this run
+            # The record failed: retry next run unless the job may leave the
+            # window first (a card without a title is not worth saving).
+            listed = card.get("listed_ms")
+            if card.get("title") and (not listed or time.time() * 1000 - listed >= _GIVE_UP_DETAIL_MINUTES * 60_000):
+                self._save(_job_from_card(job_id, card, failures.get(job_id) or stop or "not fetched"))
+        logger.info("[linkedin] New jobs: %s saved, %s record failures, %s deleted/inactive, %s for the next run.",
+                    len(self._page_jobs), len(failures), len(inactive), len(waiting))
+        self.health.check("detail_fetch", not failures,
+                          f"{len(failures)}/{len(batch)} posting records failed"
+                          + (f" (stopped: {stop}; LinkedIn is limiting access)" if stop else "")
+                          + ": " + "; ".join(f"{key}: {value}" for key, value in list(failures.items())[:3])
+                          + f". Retried next run; saved from the card after {_GIVE_UP_DETAIL_MINUTES} min."
+                          + " Evidence: " + self.diagnostics.summary())
+        self.health.check("detail_content", not shape_problems,
+                          f"{len(shape_problems)} posting record(s) unusable, saved from their cards without a "
+                          "description (API changed? update api.posting_url in markup/linkedin/selectors.json): "
+                          + "; ".join(f"{key}: {value}" for key, value in list(shape_problems.items())[:2]))
+        self.health.job_fields(self._page_jobs)
 
-            self.health.check("detail_content", bool(title and desc),
-                              f"Job {job_id}: title present={bool(title)}, description present={bool(desc)}.", html)
+    def _save(self, job: dict):
+        self._page_jobs.append(job)
+        self.seen_ids.add(job["external_id"])
+        logger.info("  [ok] %s%s", job["title"][:45], "" if job["description"] else " (card only)")
+        if self.on_job:
+            self.on_job(job)
 
-            logger.info(f"  [ok] {title[:45]}")
-            company_extra = _company_metadata(sel, d)
-            if api and api["industry"] and not company_extra.get("company_industry"):
-                company_extra["company_industry"] = api["industry"]
-            api_extra = {"detail_source": "jobs_api", "original_listed_at": api["original_listed_at"],
-                         "linkedin_reposted": api["reposted"]} if api else {"detail_source": "panel"}
-            return {
-                "source": "linkedin",
-                "external_id": str(job_id),
-                "title": title,
-                "company": company,
-                "posted_at": (api and api["listed_at"]) or _parse_linkedin_time(rel_time),
-                "description": desc,
-                "link": f"https://www.linkedin.com/jobs/view/{job_id}/",
-                "extra": {
-                    **company_extra,
-                    **{key: value for key, value in api_extra.items() if value is not None},
-                    "hiring_manager_name": mgr_name,
-                    "hiring_manager_role": mgr_role,
-                    "detail_location": header["detail_location"],
-                    "workplace": header["workplace"],
-                    "job_type": header["job_type"],
-                },
-                "scraped_at": clock.now_str(),  # UTC; posted_at stays local
-            }
-        except Exception as e:
-            self._detail_failures[str(job_id)] = type(e).__name__
-            logger.error(f"[error] Job {job_id}: {e}")
-            return None
-
-    async def _open_card(self, page, card, job_id: str) -> bool:
-        """Retry a slow detail once and require the requested job's title link.
-
-        Waiting for any existing detail panel can capture the previous card's
-        description under the new ID. A matching title link prevents that race.
-        """
-        for attempt, timeout in enumerate((_DETAIL_TIMEOUT, LINKEDIN_DETAIL_RECOVERY_TIMEOUT_SECONDS * 1000)):
-            try:
-                deadline = time.monotonic() + timeout / 1000
-                def remaining_ms():
-                    return max(1, int((deadline - time.monotonic()) * 1000))
-                await card.scroll_into_view_if_needed(timeout=remaining_ms())
-                await asyncio.sleep(random.uniform(0.8, 1.2))
-                await card.click(timeout=remaining_ms())
-                await page.wait_for_selector(
-                    self.sel["job_detail"]["title_link_for_job"].format(job_id=job_id), timeout=remaining_ms())
-                await page.wait_for_selector(self.sel["search"]["detail_panel"], timeout=remaining_ms())
-                self._detail_failures.pop(str(job_id), None)
-                if attempt:
-                    logger.info("[linkedin] Detail %s recovered on retry.", job_id)
-                return True
-            except Exception as exc:
-                self._detail_failures[str(job_id)] = type(exc).__name__ + " waiting for matching job detail"
-                try:
-                    html = await page.content()
-                except Exception:
-                    html = ""
-                if self._access_blocked(page, html):
-                    self._detail_failures[str(job_id)] = "LinkedIn login/checkpoint/access restriction"
-                    return False
-                if not attempt:
-                    logger.info("[linkedin] Detail %s did not load; retrying once with up to %ss.",
-                                job_id, LINKEDIN_DETAIL_RECOVERY_TIMEOUT_SECONDS)
-        logger.warning("[linkedin] Detail %s failed after two attempts.", job_id)
-        return False
+    async def _pause(self, low: float, high: float):
+        pause = random.uniform(low, high)  # human-like spacing between API calls
+        timing.record("linkedin", "human_delay", pause)
+        await asyncio.sleep(pause)
 
     async def parse(self, response: Response):
-        # First page only: no follow-up page requests.
+        # One window per run: no follow-up page requests.
         for job in self._page_jobs:
             yield job
 
 
 def scrape(selectors: dict, cdp_url: str, health: ScrapeHealth | None = None, on_job=None) -> dict:
-    """Run the spider. Returns {'items': [...], 'login_redirect': bool}.
+    """Run the spider. Returns {'items': [...], 'needs_login': bool, ...}.
 
     `on_job(job)` is called for each job as soon as it is scraped.
     """
@@ -911,5 +543,5 @@ def scrape(selectors: dict, cdp_url: str, health: ScrapeHealth | None = None, on
     logger.info(
         f"[spider] {len(items)} item(s) scraped in {result.stats.elapsed_seconds:.1f}s"
     )
-    return {"items": items, "login_redirect": spider._login_redirect, "needs_login": False,
+    return {"items": items, "login_redirect": False, "needs_login": False,
             "signed_in": spider._signed_in, "listings": spider.listings}

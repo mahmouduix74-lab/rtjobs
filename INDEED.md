@@ -16,6 +16,10 @@ https://eg.indeed.com/jobs?q=&l=مصر&radius=100&sort=date&vjk=992741b34fe51afd
 - Plain curl with CF cookies → 403 "Security Check" (Cloudflare captcha).
 - Must use scrapling stealth session with `solve_cloudflare=True`, persistent
   profile (cf_clearance), CDP pattern like the other boards.
+- Turnstile solves used to take exactly ~2 min (321 of 361, Oct 14-24): the
+  solver's post-click networkidle wait had no timeout, so it ran to the 120s
+  page default. Capped at 10s since 2026-10-24 (`core.browser._SolverView`,
+  AGENTS.md "Cycle latency work"). A solve still >60s = look at the solver.
 - Since ~Oct 2026 Indeed is LOGIN-GATED for anonymous sessions: even after a
   solved turnstile it 403-redirects to
   `/account/login?branding=login-required&from=bot-detection-anonymous`.
@@ -40,6 +44,10 @@ https://eg.indeed.com/jobs?q=&l=مصر&radius=100&sort=date&vjk=992741b34fe51afd
   persisted (`telegram_update_offset`); the window opens at alert time so
   stale codes are never consumed. A missed code cools down 30 min, then the
   next run starts a fresh episode (fresh code + fresh prompt).
+- The wait does not hold the other boards: the cycle closes without Indeed
+  and the next cycles run LinkedIn/Wuzzuf/NaukriGulf on schedule while Indeed
+  keeps its Chrome and waits. After the code the run ends `signed_in` (no
+  scrape); the next cycle scrapes Indeed (main.py `_detached`).
 - Gotchas:
   - Navigate with ONE in-browser `page.goto` (page_action), NOT the
     engine's redirect chain: the engine follows the 307/302 to

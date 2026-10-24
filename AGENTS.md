@@ -42,7 +42,7 @@ core/login_state.py      LinkedIn retry counter + escalating cooldown (5m/15m/30
 core/browser.py          patch_no_load_wait — see Gotchas #1
 core/human.py            random human-like delays
 boards/base.py           JobBoard run() template (RunRecord, before_browser, scrape) + persist_jobs + load_board_selectors()
-boards/linkedin/         login.py (state machine) + scraper.py (Spider)
+boards/linkedin/         login.py (state machine) + scraper.py (Spider; jobs from LinkedIn's voyager API, Gotchas #13)
 boards/wuzzuf/           scraper.py (Spider, solve_cloudflare=True)
 boards/indeed/           scraper.py (Spider, solve_cloudflare=True) — see INDEED.md
 boards/naukrigulf/       scraper.py (Spider, Akamai; jobs from the page's own search API response) — see NAUKRIGULF.md
@@ -99,7 +99,9 @@ description, link, extra(dict), scraped_at`.
    component of the slug: `/jobs/p/<id>-<slug>`. Indeed fetches the detail page
    of EVERY new card (no cap). Accepted trade-off (user, Oct 2026): after an
    outage longer than ~one page of postings, older jobs are lost for good —
-   do not add catch-up pagination.
+   do not add catch-up pagination. EXCEPTION (user, 2026-10-24): LinkedIn
+   reads its whole time-bounded recent window through the API (Gotchas #13);
+   that paging ends at the window's reported total, it is not "page 2".
 5. **LinkedIn login**: `page_action` runs right after DOMContentLoaded, BEFORE
    an active session's `/login -> /feed` redirect lands (scrapling's `wait`
    only starts after page_action) — `_wait_for_landing` must run before judging
@@ -117,7 +119,11 @@ description, link, extra(dict), scraped_at`.
    path AND the li_at cookie; unknown = signed out). Only then does the board
    run the /login check below and search again; retries reset only when the
    search page proved the session. A checkpoint on the search page goes to
-   that login check (which alerts + waits), not a scrape-health alert.
+   that login check (which alerts + waits), not a scrape-health alert; so does
+   an API answer 401 or a fetch redirected to sign-in/checkpoint. A solve in the
+   last seconds before `CHECKPOINT_WAIT_SECONDS` counts (`_handle_checkpoint`
+   waits up to 10s for /feed after the deadline; Oct 23 a solve AT the deadline
+   was counted as a failure + 30-min cooldown).
    The login check: fetch `https://www.linkedin.com/login`, fill with
    human-like typing (EN+AR aware), then `_verify_routing` waits
    event-based via `page.wait_for_url` for `(feed|/jobs|checkpoint|security_verification)`
@@ -177,10 +183,11 @@ description, link, extra(dict), scraped_at`.
     stayed on its loading shell for hours (`Pending: static.licdn.com script`).
     Measured A/B on the same profile: routed 24-59s / never; cached ~3s and
     ~0.5 MB per page. Not QUIC: h3 on/off made no difference.
-    The cache only fills if one download FINISHES: a search timeout while a
-    `static.licdn.com script` is still in flight gets one same-page wait
-    (`LINKEDIN_SLOW_ASSET_WAIT_SECONDS`, 90) instead of a reload, which would
-    restart it (each new LinkedIn release needs one full download).
+    Since the API window (Gotchas #13) the run only needs the landing page's
+    document COMMIT (origin + cookies), not the app, so a slow bundle download
+    no longer holds a run; `LINKEDIN_SLOW_ASSET_WAIT_SECONDS` and the DOM
+    search/detail recovery were removed with the DOM path. Keep the cache on
+    anyway: the page's own app still loads in the background every run.
 12. **Stop Chrome with CDP `Browser.close`, never signals first**
     (`core/browser.stop_chrome` -> `_browser_close`). Chrome writes cookies to
     disk every 30s or on a clean shutdown; SIGTERM exits at once WITHOUT that
@@ -192,11 +199,57 @@ description, link, extra(dict), scraped_at`.
     Signals stay the fallback (and the watchdog / second-signal paths).
     (Container `ls` shows UTC: compare file times with `date -u`.)
 
+13. **LinkedIn jobs come from its voyager API, read INSIDE the signed-in page**
+    (boards/linkedin/scraper.py, branch `linkedin/api-window`, 2026-10-24). Since
+    2026-10-21 05:39 Cairo `/jobs/search/?sortBy=DD` redirects to an AI search
+    page (`/jobs/search-results`, relevance order, randomized `lrm*` classes,
+    no `voyagerJobsDashJobCards` call): the DOM path saved 0 jobs for 2.5 days.
+    Each run: land on LINKEDIN_SEARCH_URL (commit only), `_signed_out` check, then
+    `page.evaluate(fetch(...))` with `csrf-token` = JSESSIONID (unquoted),
+    `x-restli-protocol-version: 2.0.0`, `accept: application/vnd.linkedin.normalized+json+2.1`
+    — real Chrome's TLS/cookies, NEVER Playwright's `context.request` (Node
+    network stack = different fingerprint).
+    a. Window: `voyagerJobsDashJobCards` decoration `JobSearchCardsCollection-221`
+       (the old search page's own; has footerItems LISTED_DATE + JobPosting
+       `repostedJob`), filters sortBy DD + `timePostedRange` r3600 + geo/distance
+       parsed from LINKEDIN_SEARCH_URL, count 25, paged until collected >= the
+       FIRST page's `paging.total`. r3600 is HOUR-BUCKETED: it covers since the
+       start of the previous clock hour (60-120 min), measured 73 jobs at 19:55
+       -> 34 at 20:00. DD is only roughly sorted (page 2 can start newer than
+       page 1's tail) — never assume "page 1 = newest".
+    b. Record per NEW id: `/voyager/api/jobs/jobPostings/<id>?decorationId=
+       com.linkedin.voyager.deco.jobs.web.shared.WebFullJobPosting-65`: title,
+       description.text, listedAt/originalListedAt, jobState, formattedLocation,
+       formattedEmploymentStatus, workplaceTypes -> included WorkplaceType, and
+       companyDetails -> included `organization.Company` (name, industries,
+       description) or `companyName` (no company page). Hiring team members
+       were empty in every sample: hiring_manager_* are gone (not a classifier
+       field). Deleted job = 404; SUSPENDED/CLOSED jobState = skipped, unmarked.
+    c. LinkedIn answers HTTP 200 even for an unknown decoration (a bogus
+       `...Lite-1` returned elements with a default shape), so status proves
+       nothing: `_parse_cards` / `_job_from_posting` validate shape and identity
+       (record id == requested id). Bad CSRF = 403 "CSRF check failed." (re-read
+       the cookie once). 401/redirect -> login check; 403/429 -> stop calls this
+       run, never retry; 5xx/network -> one retry.
+    d. A record that keeps failing is saved from its CARD (title/company/
+       location, `detail_status: fetch_failed`, empty description) once the job
+       was listed >= 45 min ago (it stays >= 60 min in the window, appears 2-7
+       min after listedAt); an unusable record (shape) is saved from its card at
+       once. Records are fetched oldest-listing first, LINKEDIN_MAX_DETAILS_PER_RUN
+       (40) per run.
+    e. Templates live in `markup/linkedin/selectors.json` "api" (bind-mounted:
+       a new decoration version is a file edit). Live evidence (profile COPY,
+       2026-10-23/24): 10 rounds x 3 min collected == total, 0 dups, ~2 calls
+       and ~2s per window; new jobs visible 1.7-6.9 min after listedAt; 9/9
+       live guest-search last-hour jobs inside our window. The guest endpoint
+       (`/jobs-guest/...`) ignores DD, is stale and 429s fast: not usable.
+
 ## Env vars (see config.py / README for defaults)
 Required: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_TEST_ID`
 (failure channel; override: `TELEGRAM_FAILURE_CHAT_ID`),
 `LINKEDIN_EMAIL`, `LINKEDIN_PASSWORD`.
-Notable: `LINKEDIN_ENABLED` (currently `True` in `.env`), `INDEED_ENABLED`
+Notable: `LINKEDIN_ENABLED` (`True` in `.env`; it was `False` 2026-10-23 19:36 to
+2026-10-24 08:12 during the AI-search outage), `INDEED_ENABLED`
 (now `True` in `.env` — re-enabled Oct 2026 with Telegram-assisted login:
 anonymous sessions 403-redirect to `/account/login?...&from=bot-detection-anonymous`,
 so the board signs in by email code — run drives the form, user replies/DMs
@@ -239,8 +292,8 @@ persists in the `indeed_profile` volume, re-login only on expiry with a
   profile clearance, full detail page for every new card (the old 10/run cap
   was removed with the first-page-only change). Login flow details in INDEED.md "Login" (esp. the `;jsessionid`
   400 trap and the post-submit OAuth wait).
-- LinkedIn: logged-in scraping verified (first page of 25, detail panels,
-  dedupe against `seen_ids`); `posted_at` matches host local time.
+- LinkedIn: API window (Gotchas #13) live since 2026-10-24 08:12 (staging on
+  copies first, 10/10 cycles ok); `posted_at` = listedAt in host local time.
 - Docker: python:3.13-slim + real Chrome + xvfb-run, `init: true`,
   `network_mode: host` on the scraper; volumes `chrome_profile`,
   `wuzzuf_profile`, `scraper_data`; `./markup` bind-mounted to
@@ -256,7 +309,10 @@ broken-markup cases must alert for all three boards without sending real message
 
 ```python
 # fixtures: markup/wuzzuf/wazzuf_guide.txt (public card DOM and SSR fields),
-#           markup/linkedin/manual_login_{en,ar}.html (sanitized login pages)
+#           markup/linkedin/manual_login_{en,ar}.html (sanitized login pages),
+#           markup/linkedin/api_{cards,posting}_sample.json (SYNTHETIC API
+#           responses with the real shape; "LISTED_1" placeholders become epoch ms
+#           via verify_offline.linkedin_fixture)
 raw = open("markup/wuzzuf/wazzuf_guide.txt", encoding="utf-8").read()
 html = raw[raw.find("<!DOCTYPE"):]
 from boards.wuzzuf.scraper import _extract_state, _extract_jobs
@@ -285,9 +341,9 @@ Set dummy env before importing config in test scripts:
   `load_board_selectors(site)`; missing file = fail loudly at startup.
 - Reposts (core/db.record_listings): employers refresh old listings and they keep
   their board job ID, so ID dedupe alone hides them. Boards report the current
-  listing time of KNOWN cards (LinkedIn: the job-cards API response
-  `voyagerJobsDashJobCards` footerItems LISTED_DATE timeAt — the rendered cards
-  show no time since Oct 2026, card text read 0 of 24; Wuzzuf SSR postedAt,
+  listing time of KNOWN cards (LinkedIn: footerItems LISTED_DATE timeAt of the
+  window's cards, Gotchas #13 — no extra request; a known job showing up in
+  the recent window is by definition freshly (re)listed; Wuzzuf SSR postedAt,
   Indeed createDate). >= REPOST_MIN_GAP_HOURS (24) newer than stored
   = repost, always recorded in `job_reposts`; re-sent with a 🔁 tag only when
   the last delivery is > REPOST_REDELIVER_AFTER_DAYS (7) old (classified in the
@@ -330,6 +386,24 @@ Set dummy env before importing config in test scripts:
   every wait for a PERSON in `board_budget.paused()` (LinkedIn checkpoint,
   Indeed emailed code). Timeouts and board crashes alert once per episode
   (run-health checks `time_budget` / `board_run`), not every run.
+  The child's budget state file (`<db>.<board>.budget`, polled by the parent)
+  is replaced in one step (temp file + `os.replace`, 2026-10-24): a truncating
+  write let the parent read `{}` at the end of a person wait, count the whole
+  wait as active time and kill the board right after the solve.
+- A wait for a PERSON never holds the cycle (branch `reliability/person-wait`,
+  2026-10-10, live 2026-10-24; the night of Oct 9-10 twelve 10-min Indeed code waits froze every
+  board for 130 min). The parent sees `paused_since` in the child's budget file
+  (`board_budget.waiting_for_person`), DETACHES it (`main._detached`) and closes
+  the cycle; the child keeps waiting with its Chrome. While one is detached the
+  parent stays up and runs the next cycles itself on the grid (`_wait_for_tick`;
+  ofelia skips ticks while the container runs), skipping that board and sparing
+  its Chrome group in `kill_stray_chrome(keep_ports=...)`. After the wait the
+  board ends its run `signed_in` WITHOUT scraping (`JobBoard.finish_after_person_wait`:
+  its saves would land in a closed cycle); the next cycle scrapes it. When no
+  board is detached any more the process exits and ofelia takes over. Signals
+  stop detached children too; the budget still applies after the wait.
+  deploy.sh waits while a board waits, and treats a board already stuck on a
+  login before the switch as "unverified" (not a rollback).
 - Telegram's shared session drops pooled sockets after 60s idle: Telegram closes
   idle keep-alives, and reuse failed the first send after every quiet spell.
 
@@ -349,10 +423,17 @@ port and logins disabled — never the production profile directly.
   networkidle BEFORE looking for a challenge on every solve_cloudflare fetch;
   now two looks (0s, 1s) with the solver's own detector, the real solver only
   for a challenge or unreadable page.
-- LinkedIn: one scroll starts the list load (was a fixed 3.2s loop); listing
-  times + LinkedIn's repostedJob flag + exact new-job posted_at come from the
-  job-cards API (`search.cards_api` marker, code default). Indeed polls for
-  its jobcards blob instead of a fixed 2.5s.
+- (2026-10-24, branch `latency/indeed-turnstile-cap`) After clicking the
+  Turnstile box the solver waited for networkidle with NO timeout = the page
+  default (Indeed: 120s); Indeed never goes idle, so 321 of 361 Indeed solves
+  Oct 14-24 took 115-125s and held the whole cycle. The real solver now runs
+  against `core.browser._SolverView`, which caps that wait at
+  `_CF_CLICK_IDLE_MS` (10s); the solver's own 10s clear-poll and retry follow
+  unchanged. Same bug in scrapling 0.5 (upstream #524): keep the cap there.
+- (Superseded 2026-10-24 by the API window, Gotchas #13:) LinkedIn scrolled
+  once to start the list load and read listing times from the page's own
+  job-cards API response. Indeed polls for its jobcards blob instead of a
+  fixed 2.5s.
 
 ## Deploy gate, pinning, alert rules (2026-10-10)
 - Deploy only with `scripts/deploy.sh` (clean main == origin/main). It builds
@@ -370,6 +451,13 @@ port and logins disabled — never the production profile directly.
 - `core.browser.verify_scrapling_contract()` runs before our patches install:
   scrapling must be `SCRAPLING_VERSION` and every replaced/called internal
   must exist. Upgrading scrapling = re-verify the patches, bump the constant.
+- Monitor alerts (core/pipeline_monitor.py, 2026-10-24): a lasting failure is
+  re-sent every PIPELINE_ALERT_REMIND_SECONDS (3 h; "Pipeline: still failing —
+  <check>", except classifier_budget) — Oct 21-23 LinkedIn was down 2.5 days
+  after ONE alert. `scrape_result_<board>` now includes the run's error text.
+  `board_quiet_<board>` (LinkedIn only, LINKEDIN_QUIET_ALERT_HOURS=6): runs ok
+  (>= half the expected count) but no new job saved for 6 h — catches a search
+  that silently returns nothing new (longest normal gap Sep 25-Oct 20: 3.2 h).
 - Alerts (core/scrape_health.py): an episode alerts when a check fails
   `CONFIRM_STREAK` (2) times in a row or `FLAP_FAILURES` (3) times within an
   hour; single blips that recover stay silent. A confirmed episode that
@@ -392,7 +480,18 @@ port and logins disabled — never the production profile directly.
   new LinkedIn jobs inside one 3-minute interval is not expected (steady state:
   median 1, p99 4, max 10 per run); Gotchas #4 stands. Reliability work goes
   into not losing runs (immediate saves, fewer failure points) instead.
+  (2026-10-24: LinkedIn now reads its whole recent window anyway, Gotchas #13.)
+- DECIDED (user, 2026-10-24): no catch-up of the LinkedIn jobs missed during the
+  Oct 21-24 outage; accepted loss.
 - Retention for latency_events / runs / scrape_batches / enrichment_requests.
+- Monitor `scrape_result_<board>` (core/pipeline_monitor.py) alerts on ONE degraded
+  run whenever the monitor polls before the next run completes, bypassing the
+  confirm-twice rule of the board checks: 2026-10-24 10:51 LinkedIn sent "latest
+  completed scrape was degraded" for window_complete 27 of 28 (LinkedIn's total ran
+  ahead of its pages), healed by the 10:54 run with nothing lost; NaukriGulf's
+  degraded run at the deploy switch stayed silent only because it healed in 23s.
+  Fix: failing only when the last TWO completed runs are not ok. User: noted, not
+  yet (2026-10-24).
 - Host Chrome (154) vs container Chrome (151): the hosted DevTools frontend can
   mismatch; use the URL printed by scripts/inspect_chrome.py.
 
@@ -419,12 +518,13 @@ port and logins disabled — never the production profile directly.
   earlier failure in the same run. An unobserved check is not a recovery.
 - Boards pass their `ScrapeHealth` instance into `scrape` and finish the run with
   `health.status`/`health.error`. Failed parser checks mean `degraded`, not `ok`,
-  while valid partial jobs are still saved. LinkedIn's captured loading shell
-  (`search.loading_shell` selector) is a loading failure, not proof of redesign.
-- LinkedIn has bounded search/detail recovery and pre-navigation diagnostics.
-  Keep `page_setup` async/awaitable. Do not retry login/checkpoint or HTTP
-  401/403/429 responses. Require the requested job's title link before parsing a
-  detail panel; otherwise the previous card's content can be assigned a new ID.
+  while valid partial jobs are still saved. LinkedIn's checks are API-based
+  (Gotchas #13): shape (`search_structure`, `detail_content`), `window_complete`,
+  `window_filter` (cards older than 3 h = time filter ignored), `listing_times`.
+- LinkedIn keeps pre-navigation diagnostics for its landing page. Keep
+  `page_setup` async/awaitable. Do not retry login/checkpoint or HTTP
+  401/403/429 responses. A posting record must carry the requested job's ID
+  (the API-era version of "require the requested job's title link").
 - User direction 2026-10-04: after staging tests, clean/push and enable production
   classification AND channel delivery. There are 25 named families plus `other`.
   Route only by job_family; employer_sector is analytics-only. All 26 channel
@@ -485,6 +585,14 @@ port and logins disabled — never the production profile directly.
 - 2026-10-10 18:30 Cairo: main `cf7db61` deployed with scripts/deploy.sh (image
   `production-cf7db61-20261010-1828`, rollback `rollback-20261010-1828`): deploy
   gate, pinned Chrome/deps, scrapling contract, confirm-twice alerts. See docs/DEPLOYMENT.md.
+- 2026-10-24 08:12 Cairo: main `c7a706b` deployed with scripts/deploy.sh (image
+  `production-c7a706b-20261024-0810`, rollback `rollback-20261024-0810` = cf7db61,
+  whose LinkedIn cannot read the AI page: set LINKEDIN_ENABLED=False with it):
+  person-wait + LinkedIn API window + monitor reminders. See docs/DEPLOYMENT.md.
+- 2026-10-24 10:35 Cairo: main `0b8347a` deployed (image
+  `production-0b8347a-20261024-1033`, rollback `rollback-20261024-1033` = c7a706b):
+  atomic budget file (F3), reservation release rule (F1), Indeed Turnstile
+  post-click cap, Mindrift blocked. See docs/DEPLOYMENT.md.
 
 ## Immediate queue notifications
 - After committing a complete scrape cycle, notify `enrichment`; after committing
@@ -512,6 +620,12 @@ port and logins disabled — never the production profile directly.
   still be billed), connection-level failures release it. Previously every
   failed attempt kept its ~$0.02 reservation and ~45 flaky attempts leaked
   ~$0.95 of the $1 daily budget, deferring 200 jobs to midnight.
+  2026-10-24 (code review F1): the release rule is "the provider provably did
+  not bill": nothing sent (`classify.RequestNotSent`, e.g. no API key; a
+  connection failure; the request's audit row failed to write) or an HTTP
+  error status. Timeouts, broken bodies and 2xx answers that fail validation
+  keep the reservation. A kept reservation is never lost money, but enough of
+  them pause classification until midnight (`daily_budget_exhausted`).
 - Latency instrumentation is mandatory infrastructure, not optional logging:
   `core/timing.py` (`stage`/`timed`/`record`) writes one `latency_events` row
   + one parseable `LATENCY source=.. stage=.. seconds=..` INFO line per stage
