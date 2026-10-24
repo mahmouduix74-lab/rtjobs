@@ -923,6 +923,25 @@ def verify_first_page_and_schedule():
     assert abs(board_budget.active_seconds(100.0, str(state), now=200.0) - 70) < 1e-6
     state.write_text(json.dumps({"paused_total": 0, "paused_since": 150.0}))
     assert abs(board_budget.active_seconds(100.0, str(state), now=200.0) - 50) < 1e-6
+    # The child replaces the file in one step, so the parent never reads it
+    # half written (truncate-then-write tore 72% of these reads; one torn read
+    # at the end of a person wait killed the board).
+    writer = ("import sys, time\n"
+              f"sys.path.insert(0, {str(ROOT)!r})\n"
+              "from core import board_budget\n"
+              "end = time.time() + 1.0\n"
+              "while time.time() < end:\n"
+              "    board_budget._write_state(123.0)\n")
+    proc = subprocess.Popen([sys.executable, "-c", writer], env={**os.environ, board_budget.STATE_ENV: str(state)})
+    torn = 0
+    while proc.poll() is None:
+        torn += not board_budget.waiting_for_person(str(state))
+    assert proc.returncode == 0 and torn == 0, f"{torn} torn budget-file reads"
+    with patch.dict(os.environ, {board_budget.STATE_ENV: str(state.parent / "gone" / "board.budget")}), \
+            patch.object(board_budget, "_write_failed", False), patch.object(board_budget.logger, "warning") as warn:
+        board_budget._write_state(1.0)
+        board_budget._write_state(None)
+        assert warn.call_count == 1, "an unwritable state file is reported once, not swallowed"
     batch = entry.db.start_scrape_batch()
     with entry.db.get_db() as conn:  # earlier tests' Indeed jobs can share this second
         conn.execute("UPDATE jobs SET scraped_at='2026-01-01 00:00:00' WHERE source='indeed'")
@@ -956,7 +975,7 @@ def verify_first_page_and_schedule():
             patch.object(entry.sys, "argv", ["main.py", "--board", "wuzzuf", "--batch-id", "41"]):
         assert entry.main() == 0 and seen["batch"] == 41
     entry.db.set_active_batch(None)
-    print("PASS parallel boards: all start together, cycle waits for the slowest, failures and SIGTERM propagate, stuck board killed from outside; child joins the batch")
+    print("PASS parallel boards: all start together, cycle waits for the slowest, failures and SIGTERM propagate, stuck board killed from outside, budget file never read half written; child joins the batch")
 
     # A broken selectors.json (live-editable bind mount) skips only that board,
     # alerts once per episode, and the exit code reports the failure.
