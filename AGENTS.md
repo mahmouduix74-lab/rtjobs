@@ -248,8 +248,8 @@ description, link, extra(dict), scraped_at`.
 Required: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_TEST_ID`
 (failure channel; override: `TELEGRAM_FAILURE_CHAT_ID`),
 `LINKEDIN_EMAIL`, `LINKEDIN_PASSWORD`.
-Notable: `LINKEDIN_ENABLED` (`False` in `.env` since 2026-10-23 19:36 — the
-AI-search outage; set back to `True` once the API window is deployed), `INDEED_ENABLED`
+Notable: `LINKEDIN_ENABLED` (`True` in `.env`; it was `False` 2026-10-23 19:36 to
+2026-10-24 08:12 during the AI-search outage), `INDEED_ENABLED`
 (now `True` in `.env` — re-enabled Oct 2026 with Telegram-assisted login:
 anonymous sessions 403-redirect to `/account/login?...&from=bot-detection-anonymous`,
 so the board signs in by email code — run drives the form, user replies/DMs
@@ -292,8 +292,8 @@ persists in the `indeed_profile` volume, re-login only on expiry with a
   profile clearance, full detail page for every new card (the old 10/run cap
   was removed with the first-page-only change). Login flow details in INDEED.md "Login" (esp. the `;jsessionid`
   400 trap and the post-submit OAuth wait).
-- LinkedIn: API window (Gotchas #13) verified on a profile copy 2026-10-24
-  (offline suite + staging cycles); `posted_at` = listedAt in host local time.
+- LinkedIn: API window (Gotchas #13) live since 2026-10-24 08:12 (staging on
+  copies first, 10/10 cycles ok); `posted_at` = listedAt in host local time.
 - Docker: python:3.13-slim + real Chrome + xvfb-run, `init: true`,
   `network_mode: host` on the scraper; volumes `chrome_profile`,
   `wuzzuf_profile`, `scraper_data`; `./markup` bind-mounted to
@@ -387,7 +387,7 @@ Set dummy env before importing config in test scripts:
   Indeed emailed code). Timeouts and board crashes alert once per episode
   (run-health checks `time_budget` / `board_run`), not every run.
 - A wait for a PERSON never holds the cycle (branch `reliability/person-wait`,
-  2026-10-10; the night of Oct 9-10 twelve 10-min Indeed code waits froze every
+  2026-10-10, live 2026-10-24; the night of Oct 9-10 twelve 10-min Indeed code waits froze every
   board for 130 min). The parent sees `paused_since` in the child's budget file
   (`board_budget.waiting_for_person`), DETACHES it (`main._detached`) and closes
   the cycle; the child keeps waiting with its Chrome. While one is detached the
@@ -566,6 +566,10 @@ port and logins disabled — never the production profile directly.
 - 2026-10-10 18:30 Cairo: main `cf7db61` deployed with scripts/deploy.sh (image
   `production-cf7db61-20261010-1828`, rollback `rollback-20261010-1828`): deploy
   gate, pinned Chrome/deps, scrapling contract, confirm-twice alerts. See docs/DEPLOYMENT.md.
+- 2026-10-24 08:12 Cairo: main `c7a706b` deployed with scripts/deploy.sh (image
+  `production-c7a706b-20261024-0810`, rollback `rollback-20261024-0810` = cf7db61,
+  whose LinkedIn cannot read the AI page: set LINKEDIN_ENABLED=False with it):
+  person-wait + LinkedIn API window + monitor reminders. See docs/DEPLOYMENT.md.
 
 ## Immediate queue notifications
 - After committing a complete scrape cycle, notify `enrichment`; after committing
