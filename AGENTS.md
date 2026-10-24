@@ -509,6 +509,9 @@ port and logins disabled — never the production profile directly.
   IDs (no extra request) to the window_complete detail and the `job_list` latency
   row (`served`, `repeated`), live 2026-10-24 15:35. Repeats = pages shift (fix: overlapping pages); none and
   served < total = LinkedIn counts a job it does not list (needs another query).
+  ANSWER (15:42-15:45, first gap after the deploy): `served [25,25,4,0]` /
+  `[25,25,5,0]`, 0 repeated, total one higher = LinkedIn counts a job it does not
+  list. Our paging cannot reach it; finding it needs a second query (another sort).
 - Host Chrome (154) vs container Chrome (151): the hosted DevTools frontend can
   mismatch; use the URL printed by scripts/inspect_chrome.py.
 
