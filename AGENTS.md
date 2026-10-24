@@ -386,6 +386,10 @@ Set dummy env before importing config in test scripts:
   every wait for a PERSON in `board_budget.paused()` (LinkedIn checkpoint,
   Indeed emailed code). Timeouts and board crashes alert once per episode
   (run-health checks `time_budget` / `board_run`), not every run.
+  The child's budget state file (`<db>.<board>.budget`, polled by the parent)
+  is replaced in one step (temp file + `os.replace`, 2026-10-24): a truncating
+  write let the parent read `{}` at the end of a person wait, count the whole
+  wait as active time and kill the board right after the solve.
 - A wait for a PERSON never holds the cycle (branch `reliability/person-wait`,
   2026-10-10, live 2026-10-24; the night of Oct 9-10 twelve 10-min Indeed code waits froze every
   board for 130 min). The parent sees `paused_since` in the child's budget file

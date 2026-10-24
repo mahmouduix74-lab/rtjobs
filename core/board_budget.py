@@ -25,24 +25,45 @@ froze every board for 130 minutes in total.
 
 from contextlib import contextmanager
 import json
+import logging
 import os
 import signal
 import time
 
+logger = logging.getLogger(__name__)
+
 STATE_ENV = "RTJOBS_BUDGET_FILE"
 _paused_total = 0.0
 _person_waits = 0  # paused() entries in this process
+_write_failed = False
 
 
 def _write_state(paused_since: float | None):
+    """Replace the state file in one step (temp file + rename).
+
+    The parent polls it while a board runs. open("w") truncates first, so a
+    read between the truncate and the write saw no pause at all; at the end of
+    a person wait that counts the whole wait as active time, and the parent
+    killed the board right after the person had solved it (a tight-loop test
+    tore 72% of reads).
+    """
+    global _write_failed
     path = os.environ.get(STATE_ENV)
     if not path:
         return
+    temp = f"{path}.{os.getpid()}.tmp"
     try:
-        with open(path, "w") as state:
+        with open(temp, "w") as state:
             json.dump({"paused_total": _paused_total, "paused_since": paused_since}, state)
-    except OSError:
-        pass
+        os.replace(temp, path)
+    except OSError as exc:
+        if not _write_failed:  # without the file the parent counts waits as active time
+            logger.warning("Cannot write the time-budget state file %s: %s", path, exc)
+        _write_failed = True
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
 
 
 def active_seconds(started: float, state_path: str, now: float | None = None) -> float:
