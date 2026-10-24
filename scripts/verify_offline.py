@@ -1530,6 +1530,31 @@ def verify_naukrigulf():
     with patch.object(telegram, "notify_failure", return_value=True) as alert:
         blocked.health.report(); blocked.health.report()
         assert alert.call_count == 1 and "naukrigulf" in alert.call_args.args[0].lower()
+    # A navigation aborted by a local network change (every container switch)
+    # gets one more visit; any other failure keeps the one-visit rule.
+    def runs(*kinds):
+        queue, starts = list(kinds), []
+        def start(self):
+            kind = queue.pop(0); starts.append(kind)
+            if kind == "ok":
+                self.health.check("search_fetch", True)
+            else:
+                self.navigation_error = f"Page.goto: net::{kind} at https://www.naukrigulf.com/jobs-in-egypt"
+            return SimpleNamespace(items=[{"external_id": "1"}] if kind == "ok" else [],
+                                   stats=SimpleNamespace(elapsed_seconds=0.1))
+        health = ng.ScrapeHealth("naukrigulf")
+        with patch.object(ng.NaukriGulfJobSpider, "start", autospec=True, side_effect=start), \
+             patch.object(ng.time, "sleep") as pause, patch.object(ng.ScrapeHealth, "report"):
+            out = ng.scrape(sel, "http://127.0.0.1:1", health)
+        return out, health, starts, pause.call_count
+    out, health, starts, pauses = runs("ERR_NETWORK_CHANGED", "ok")
+    assert starts == ["ERR_NETWORK_CHANGED", "ok"] and pauses == 1 and len(out["items"]) == 1 and health.status == "ok"
+    out, health, starts, _ = runs("ERR_NETWORK_CHANGED", "ERR_NETWORK_CHANGED")
+    assert len(starts) == 2 and not out["items"] and "Search navigation failed: Page.goto: net::ERR_NETWORK_CHANGED" \
+        in health.error, health.error
+    out, health, starts, pauses = runs("ERR_NAME_NOT_RESOLVED")
+    assert starts == ["ERR_NAME_NOT_RESOLVED"] and not pauses and "ERR_NAME_NOT_RESOLVED" in health.error
+    assert runs("ok")[2] == ["ok"]
     # Board wiring: registered, own CDP port, selectors present.
     assert NaukriGulfBoard in entry.BOARDS and NaukriGulfBoard.port_offset == 3
     offsets = [cls.port_offset for cls in entry.BOARDS]
