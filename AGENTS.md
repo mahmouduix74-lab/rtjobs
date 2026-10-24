@@ -455,7 +455,12 @@ port and logins disabled — never the production profile directly.
 - Monitor alerts (core/pipeline_monitor.py, 2026-10-24): a lasting failure is
   re-sent every PIPELINE_ALERT_REMIND_SECONDS (3 h; "Pipeline: still failing —
   <check>", except classifier_budget) — Oct 21-23 LinkedIn was down 2.5 days
-  after ONE alert. `scrape_result_<board>` now includes the run's error text.
+  after ONE alert. `scrape_result_<board>` now includes the run's error text, and
+  (branch `reliability/monitor-confirm-twice`, 2026-10-24) follows the board checks'
+  confirm rule: it fails only when the last CONFIRM_STREAK (2) completed runs are not
+  ok, or FLAP_FAILURES (3) runs within the hour were, and the latest is still bad.
+  Before, ONE degraded run alerted whenever the monitor polled before the next run
+  finished (10:51 LinkedIn window_complete 27 of 28, healed at 10:54, nothing lost).
   `board_quiet_<board>` (LinkedIn only, LINKEDIN_QUIET_ALERT_HOURS=6): runs ok
   (>= half the expected count) but no new job saved for 6 h — catches a search
   that silently returns nothing new (longest normal gap Sep 25-Oct 20: 3.2 h).
@@ -485,14 +490,6 @@ port and logins disabled — never the production profile directly.
 - DECIDED (user, 2026-10-24): no catch-up of the LinkedIn jobs missed during the
   Oct 21-24 outage; accepted loss.
 - Retention for latency_events / runs / scrape_batches / enrichment_requests.
-- Monitor `scrape_result_<board>` (core/pipeline_monitor.py) alerts on ONE degraded
-  run whenever the monitor polls before the next run completes, bypassing the
-  confirm-twice rule of the board checks: 2026-10-24 10:51 LinkedIn sent "latest
-  completed scrape was degraded" for window_complete 27 of 28 (LinkedIn's total ran
-  ahead of its pages), healed by the 10:54 run with nothing lost; NaukriGulf's
-  degraded run at the deploy switch stayed silent only because it healed in 23s.
-  Fix: failing only when the last TWO completed runs are not ok. User: noted, not
-  yet (2026-10-24).
 - Host Chrome (154) vs container Chrome (151): the hosted DevTools frontend can
   mismatch; use the URL printed by scripts/inspect_chrome.py.
 

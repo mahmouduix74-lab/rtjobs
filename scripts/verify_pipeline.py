@@ -425,8 +425,34 @@ def main():
                 with db.get_db() as conn:
                     conn.execute("DELETE FROM jobs WHERE source='linkedin'")
                     conn.execute("DELETE FROM runs WHERE source='linkedin'")
+            # A board's latest result follows the board checks' confirm rule: one
+            # bad run that the next run heals stays silent (2026-10-24 10:51 LinkedIn
+            # alerted for window_complete 27 of 28, healed 3 minutes later).
+            def result(*statuses):
+                with db.get_db() as conn:
+                    conn.execute("DELETE FROM runs WHERE source='linkedin'")
+                    conn.executemany("INSERT INTO runs (source,status,error,started_at,finished_at) VALUES ('linkedin',?,?,?,?)",
+                        [(status, None if status in ('ok', 'running') else 'window_complete: 27 of 28', stamp(3 * (len(statuses) - n)),
+                          stamp(3 * (len(statuses) - n))) for n, status in enumerate(statuses)])
+                return monitor.collect_checks(now=now)['scrape_result_linkedin']
+            with patch.object(config, 'LINKEDIN_ENABLED', True):
+                assert not result('degraded')[0], 'a single run is not confirmed'
+                assert not result('ok', 'degraded')[0], 'one bad run waits for the next'
+                failing, detail = result('ok', 'degraded', 'degraded')
+                assert failing and 'window_complete: 27 of 28' in detail and 'the last 2 runs were not ok' in detail, detail
+                assert result('ok', 'degraded', 'degraded', 'running')[0], 'a running run proves nothing yet'
+                assert not result('degraded', 'degraded', 'ok')[0], 'healed by the latest run'
+                assert not result('degraded', 'signed_in')[0], 'signed in after a person wait counts as ok'
+                assert not result('degraded', 'ok', 'degraded')[0], 'two bad runs with an ok run between them are a blip'
+                failing, detail = result('degraded', 'ok', 'degraded', 'ok', 'degraded')
+                assert failing and '3 runs in the last hour were not ok' in detail, detail
+                with patch.object(config, 'LINKEDIN_ENABLED', False):
+                    assert not result('degraded', 'degraded')[0], 'disabled boards never alert'
+                with db.get_db() as conn:
+                    conn.execute("DELETE FROM runs WHERE source='linkedin'")
             client.close(); fresh.close()
-            print('PASS monitor stale heartbeats, persistent alert episodes, failed-send retry, 3-hourly reminders, quiet-board check, dry run and degraded heartbeat suppression')
+            print('PASS monitor stale heartbeats, persistent alert episodes, failed-send retry, 3-hourly reminders, quiet-board check, '
+                  'scrape results confirmed twice (or 3 per hour), dry run and degraded heartbeat suppression')
 
 
 if __name__ == '__main__':
