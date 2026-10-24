@@ -16,7 +16,7 @@ import threading
 import requests
 
 import config
-from core import clock, db, telegram
+from core import clock, db, scrape_health, telegram
 from core.classify import CAPACITY_PREFIX
 from core.log import setup_logging
 
@@ -44,17 +44,30 @@ def collect_checks(now=None, started_at=None):
         for board in ('linkedin', 'wuzzuf', 'indeed', 'naukrigulf'):
             enabled = getattr(config, board.upper() + '_ENABLED')
             latest = conn.execute('SELECT status,started_at FROM runs WHERE source=? ORDER BY id DESC LIMIT 1', (board,)).fetchone()
-            completed = conn.execute("SELECT status,error FROM runs WHERE source=? AND status!='running' ORDER BY id DESC LIMIT 1", (board,)).fetchone()
+            completed = conn.execute("SELECT status,error FROM runs WHERE source=? AND status!='running' ORDER BY id DESC LIMIT ?",
+                                     (board, scrape_health.CONFIRM_STREAK)).fetchall()
+            since = (now - timedelta(seconds=scrape_health.FLAP_WINDOW_SECONDS)).strftime(clock.FORMAT)
+            flaps = conn.execute("SELECT COUNT(*) FROM runs WHERE source=? AND status NOT IN ('ok','signed_in','running') "
+                                 "AND started_at>=?", (board, since)).fetchone()[0]
             age = _age(latest['started_at'], now) if latest else None
             checks['scraper_' + board] = (bool(enabled and not grace and (age is None or age > config.PIPELINE_SCRAPER_STALE_SECONDS)),
                 f'{board}: no recent scrape start within {config.PIPELINE_SCRAPER_STALE_SECONDS}s; check scheduler, host uptime and network.')
             # Parser alerts carry snapshots. This separate check prevents a
             # recent failed scrape from being advertised as a healthy pipeline.
             # signed_in: the run signed in after waiting for you; the next cycle scrapes.
-            error = ((completed['error'] if completed else '') or '')[:300]
-            checks['scrape_result_' + board] = (bool(enabled and completed and completed['status'] not in ('ok', 'signed_in')),
-                f'{board}: latest completed scrape was {completed["status"] if completed else "unobserved"}'
-                + (f' ({error})' if error else '') + '; see board alerts and logs.')
+            # Same confirm rule as the board checks (core/scrape_health): the last
+            # CONFIRM_STREAK runs bad, or FLAP_FAILURES bad runs within the window.
+            # One bad run that the next run heals stays silent (2026-10-24 10:51:
+            # LinkedIn's window total ran ahead of its pages for one run).
+            bad = [row['status'] not in ('ok', 'signed_in') for row in completed]
+            streak = len(bad) == scrape_health.CONFIRM_STREAK and all(bad)
+            last = completed[0] if completed else None
+            error = ((last['error'] if last else '') or '')[:300]
+            checks['scrape_result_' + board] = (bool(enabled and bad and bad[0] and (streak or flaps >= scrape_health.FLAP_FAILURES)),
+                f'{board}: latest completed scrape was {last["status"] if last else "unobserved"}'
+                + (f' ({error})' if error else '')
+                + (f'; the last {len(completed)} runs were not ok' if streak else f'; {flaps} runs in the last hour were not ok')
+                + '; see board alerts and logs.')
             quiet_hours = config.BOARD_QUIET_ALERT_HOURS.get(board) or 0
             if quiet_hours:
                 # Runs that "work" but find nothing new: an API/filter change
