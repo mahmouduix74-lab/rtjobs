@@ -501,8 +501,11 @@ port and logins disabled — never the production profile directly.
   1-2 fewer distinct IDs than `paging.total` (each gap run needed an extra, empty
   page). The busy 14:00 hour's gaps were jobs served late (gone at 15:00, 40 of 40);
   ONE job counted since 13:03 was never served until it left the window = possibly
-  missed. Logs cannot tell a repeat across pages from a hidden job: log per-page
-  counts and repeated IDs (no extra request) before choosing a fix. Not yet started.
+  missed. Logs could not tell a repeat across pages from a hidden job; branch
+  `reliability/linkedin-window-diagnostics` adds per-page card counts and repeated
+  IDs (no extra request) to the window_complete detail and the `job_list` latency
+  row (`served`, `repeated`). Repeats = pages shift (fix: overlapping pages); none and
+  served < total = LinkedIn counts a job it does not list (needs another query).
 - Host Chrome (154) vs container Chrome (151): the hosted DevTools frontend can
   mismatch; use the URL printed by scripts/inspect_chrome.py.
 

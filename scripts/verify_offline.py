@@ -1796,6 +1796,18 @@ def verify_browser_recovery():
         assert not spider.health.checks["window_filter"]["good"] and spider.health.checks["window_complete"]["good"]
         spider, _ = await run(LinkedInApiPage([(200, cards_body(ids[:25], total=40)), (200, cards_body([], total=40))]), known=ids)
         assert not spider.health.checks["window_complete"]["good"] and "25 of the 40" in spider.health.error
+        # The gap says which kind it is (2026-10-24: total ran 1-2 ahead for 2 h):
+        # a job served on two pages hides another, or LinkedIn counts one it never serves.
+        page = LinkedInApiPage([(200, cards_body(ids[:25], total=30)), (200, cards_body(ids[24:29], total=30)),
+                                (200, cards_body([], total=30))])
+        spider, _ = await run(page, known=ids)
+        assert not spider.health.checks["window_complete"]["good"] and len(page.calls) == 3
+        assert "29 of the 30" in spider.health.error and "pages served 25+5+0 cards, 1 repeated from an earlier page" \
+            f" ({ids[24]})" in spider.health.error, spider.health.error
+        page = LinkedInApiPage([(200, cards_body(ids[:25], total=30)), (200, cards_body(ids[25:29], total=30)),
+                                (200, cards_body([], total=30))])
+        spider, _ = await run(page, known=ids)
+        assert "pages served 25+4+0 cards, 0 repeated from an earlier page." in spider.health.error, spider.health.error
         odd = cards_body(ids[:2])
         odd["data"]["elements"].append({"jobCardUnion": {"*jobPostingCard": "urn:li:fsd_promotedCard:1"}})
         spider, _ = await run(LinkedInApiPage([(200, odd)]), known=ids)
