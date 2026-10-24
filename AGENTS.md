@@ -425,8 +425,9 @@ port and logins disabled — never the production profile directly.
   for a challenge or unreadable page.
 - (2026-10-24, branch `latency/indeed-turnstile-cap`) After clicking the
   Turnstile box the solver waited for networkidle with NO timeout = the page
-  default (Indeed: 120s); Indeed never goes idle, so 321 of 361 Indeed solves
-  Oct 14-24 took 115-125s and held the whole cycle. The real solver now runs
+  default (Indeed: 120s); Indeed never went idle, so 321 of 361 Indeed solves
+  Oct 9-22 took 115-125s and held the whole cycle (it stopped on Indeed's side
+  Oct 22 14:57 Cairo, solves 3-8s since; the cap guards a return). The real solver now runs
   against `core.browser._SolverView`, which caps that wait at
   `_CF_CLICK_IDLE_MS` (10s); the solver's own 10s clear-poll and retry follow
   unchanged. Same bug in scrapling 0.5 (upstream #524): keep the cap there.

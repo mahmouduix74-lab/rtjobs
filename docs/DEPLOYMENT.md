@@ -314,7 +314,10 @@ Three branches from the code review triage, each tested on its own, then merged
   HTTP error status); timeouts and 2xx answers keep it (review F1).
 - `latency/indeed-turnstile-cap` (`00b51f8`): the Cloudflare solver's post-click
   network-idle wait is capped at 10s (was the 120s page default: 321 of 361
-  Indeed solves Oct 14-24 took 115-125s and held the cycle).
+  Indeed solves Oct 9-22 took 115-125s and held the cycle). Indeed's
+  never-idle page stopped on its own Oct 22 14:57 (solves 3-8s since), so
+  production had no 2-minute solve to cut after the deploy; the offline test
+  drives scrapling's real solver through the capped wait.
 Also on main: Mindrift blocked on every board (`4d3ab97`, live via the bind
 mount since 10:10, before this deploy).
 
