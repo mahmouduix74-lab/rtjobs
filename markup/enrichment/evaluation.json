@@ -330,5 +330,183 @@
       "classification.specialization": "country_regional_management",
       "seniority.level": "Executive"
     }
+  },
+  {
+    "name": "office_cashier",
+    "job": {
+      "id": 20,
+      "source": "linkedin",
+      "title": "Cashier",
+      "company": "Nile Advisory Law Firm",
+      "description": "Handle daily cash transactions at our Cairo office, receive client payments, issue receipts, manage petty cash, prepare bank deposits and send daily cash reports to the accounts team.",
+      "extra": {}
+    },
+    "expected": {
+      "classification.job_family": "accounting_finance_banking",
+      "classification.specialization": "treasury"
+    }
+  },
+  {
+    "name": "store_cashier",
+    "job": {
+      "id": 21,
+      "source": "linkedin",
+      "title": "Cashier",
+      "company": "Fresh Basket Supermarkets",
+      "description": "Operate the point-of-sale till at our supermarket branch, scan items, take cash and card payments, and keep the checkout area tidy.",
+      "extra": {}
+    },
+    "expected": {
+      "classification.job_family": "retail_store_operations",
+      "classification.specialization": "cashiering"
+    }
+  },
+  {
+    "name": "sales_title_inbound_duties",
+    "job": {
+      "id": 22,
+      "source": "linkedin",
+      "title": "Real Estate Sales Representative",
+      "company": "Palm Compounds Developments",
+      "description": "Answer customer inquiries by phone, email and WhatsApp about our compounds, resolve complaints and assign new leads to our sales partners. Keep records of leads in the CRM.",
+      "extra": {}
+    },
+    "expected": {
+      "classification.job_family": "sales_business_development"
+    }
+  },
+  {
+    "name": "call_center_title_sales_targets",
+    "job": {
+      "id": 23,
+      "source": "linkedin",
+      "title": "Call Center Agent",
+      "company": "Delta Mobile Store",
+      "description": "Handle inbound customer calls about orders and deliveries, solve customer issues and offer accessories to callers. Monthly sales targets with incentives.",
+      "extra": {}
+    },
+    "expected": {
+      "classification.job_family": "customer_service_call_center"
+    }
+  },
+  {
+    "name": "ai_gig_physician",
+    "job": {
+      "id": 24,
+      "source": "linkedin",
+      "title": "Medical Doctor - Freelance AI Trainer (Remote, $80-$120/hr)",
+      "company": "Expert Data Labs",
+      "description": "Licensed physicians review and rate AI model answers to clinical questions and write model answers for training medical AI. Remote, flexible hours, paid hourly. MD required.",
+      "extra": {}
+    },
+    "expected": {
+      "classification.job_family": "healthcare_medical",
+      "classification.specialization": "physicians"
+    }
+  },
+  {
+    "name": "ai_gig_annotation",
+    "job": {
+      "id": 25,
+      "source": "linkedin",
+      "title": "Arabic Data Annotator",
+      "company": "Expert Data Labs",
+      "description": "Label Arabic text and rate chatbot replies for fluency and tone to help train AI models. Native Egyptian Arabic required; no other background needed.",
+      "extra": {}
+    },
+    "expected": {
+      "classification.job_family": "content_media_communications",
+      "classification.specialization": "ai_data_annotation"
+    }
+  },
+  {
+    "name": "junk_post",
+    "job": {
+      "id": 26,
+      "source": "linkedin",
+      "title": "Owner",
+      "company": "Lotus Wellness Studio",
+      "description": "Lotus Wellness StudioLotus Wellness StudioLotus Wellness StudioLotus Wellness StudioLotus Wellness Studio",
+      "extra": {}
+    },
+    "expected": {
+      "classification.job_family": "other",
+      "classification.routing_confidence": "Low",
+      "classification.needs_review": true
+    }
+  },
+  {
+    "name": "title_description_mismatch",
+    "job": {
+      "id": 27,
+      "source": "linkedin",
+      "title": "Cloud Engineer",
+      "company": "Bright Pixel Marketing",
+      "description": "The Director role at Granite Construction is a full-time, on-site position in Cairo. The Director provides strategic leadership for construction projects and business operations and manages budgets and cross-functional teams.",
+      "extra": {}
+    },
+    "expected": {
+      "classification.job_family": "other",
+      "classification.routing_confidence": "Low",
+      "classification.needs_review": true
+    }
+  },
+  {
+    "name": "executive_driver",
+    "job": {
+      "id": 28,
+      "source": "linkedin",
+      "title": "Driver - CEO Office",
+      "company": "Cairo Agricultural Research Center",
+      "description": "Provide safe and timely transportation for the CEO and official visitors, keep the assigned vehicle maintained and plan routes. Valid driving license required.",
+      "extra": {}
+    },
+    "expected": {
+      "classification.job_family": "supply_chain_procurement_logistics",
+      "classification.specialization": "logistics_transportation"
+    }
+  },
+  {
+    "name": "short_specific_title",
+    "job": {
+      "id": 29,
+      "source": "linkedin",
+      "title": "Senior Accountant",
+      "company": "Orbit Trading",
+      "description": "",
+      "extra": {}
+    },
+    "expected": {
+      "classification.job_family": "accounting_finance_banking",
+      "seniority.level": "Senior"
+    }
+  },
+  {
+    "name": "selling_title_boilerplate",
+    "job": {
+      "id": 30,
+      "source": "naukrigulf",
+      "title": "Assistant Conference and Catering Sales Manager",
+      "company": "Harbor View Hotels",
+      "description": "Promote awareness of the brand image internally and externally. Follow up with guests to ensure their requests are met. Attend daily line-ups. Follow all company policies and procedures and keep uniform and personal appearance clean and professional.",
+      "extra": {}
+    },
+    "expected": {
+      "classification.job_family": "sales_business_development"
+    }
+  },
+  {
+    "name": "customer_service_title_account_duties",
+    "job": {
+      "id": 31,
+      "source": "linkedin",
+      "title": "Customer Service Advisor - Spanish Speakers",
+      "company": "Atlas Freight Europe",
+      "description": "Manage key client accounts, keep customers informed about their shipments, grow account revenue and coordinate a small team of advisors. Fluent Spanish and English required.",
+      "extra": {}
+    },
+    "expected": {
+      "classification.job_family": "customer_service_call_center"
+    }
   }
 ]
