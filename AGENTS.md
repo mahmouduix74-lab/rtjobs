@@ -219,6 +219,12 @@ description, link, extra(dict), scraped_at`.
        start of the previous clock hour (60-120 min), measured 73 jobs at 19:55
        -> 34 at 20:00. DD is only roughly sorted (page 2 can start newer than
        page 1's tail) — never assume "page 1 = newest".
+       `paging.total` can run AHEAD of the list (2026-10-24): a new job is counted
+       minutes before its card is served, and one job counted for 2 h was never
+       served. A list that ended (short page) with no repeats and <= 3 short
+       (`_COUNT_AHEAD_MAX`) is that: one page in relevance order (`sortBy:List(R)`,
+       derived from cards_url) looks for the missing jobs (found ones are read as
+       usual), logged, no alert. Repeats or bigger gaps still fail window_complete.
     b. Record per NEW id: `/voyager/api/jobs/jobPostings/<id>?decorationId=
        com.linkedin.voyager.deco.jobs.web.shared.WebFullJobPosting-65`: title,
        description.text, listedAt/originalListedAt, jobState, formattedLocation,
@@ -512,6 +518,9 @@ port and logins disabled — never the production profile directly.
   ANSWER (15:42-15:45, first gap after the deploy): `served [25,25,4,0]` /
   `[25,25,5,0]`, 0 repeated, total one higher = LinkedIn counts a job it does not
   list. Our paging cannot reach it; finding it needs a second query (another sort).
+  DONE on branch `reliability/linkedin-count-ahead` (Gotchas #13a): such gaps no longer
+  alert, and one relevance-order page looks for the job. Check its `probe` field in the
+  job_list latency rows: `found` non-empty = jobs the date order hid, now saved.
 - Host Chrome (154) vs container Chrome (151): the hosted DevTools frontend can
   mismatch; use the URL printed by scripts/inspect_chrome.py.
 
