@@ -327,3 +327,38 @@ naukrigulf degraded/ok (first run `ERR_NETWORK_CHANGED` during the container
 switch, as at the last two switches; next run ok, no alert). Image
 `rtjobs-scraper:production-0b8347a-20261024-1033`; rollback target
 `rtjobs-scraper:rollback-20261024-1033` (= c7a706b). Schema unchanged.
+
+## 2026-10-24 15:05 Cairo: monitor confirm rule + classifier routing rules (`4b43f80`)
+
+Two branches, each tested on its own, then merged (offline suite passed on the
+merged tree):
+- `reliability/monitor-confirm-twice` (`50d036c`): the monitor's
+  `scrape_result_<board>` alert follows the board checks' confirm rule (last 2
+  completed runs bad, or 3 bad runs in the hour, latest still bad). 10:51 one
+  degraded LinkedIn run (window_complete 27 of 28) alerted although the next
+  run healed it.
+- `classify/prompt-rules` (`5192758`, prompt version `471001db34d1b320`, was
+  `fc50eb290846c12b`): the user's routing rules (AI-training gigs by expertise,
+  selling titles -> Sales, call-center/CS titles -> Customer Service, cashiers,
+  drivers, junk posts -> other/Low). Paid eval: 92/94 hand-judged real jobs (old
+  prompt 82/94), 12/12 new synthetic cases. See docs/classifier-validation.md.
+
+First attempt (14:50-14:54) ROLLED BACK: "boards never ok: linkedin
+degraded/degraded". Not caused by the change: production LinkedIn had been
+`degraded` on every run since 13:03 (window_complete: LinkedIn's total ran 1-2
+ahead of the distinct IDs its pages served; alerted 13:06). It healed at the
+15:00 hour boundary (40 of 40). The gate treats only boards stuck on a login
+before the switch as "unverified", so a board already degraded before the
+switch blocks a deploy until it has an ok run again.
+
+The rollback restart (14:54) put the NEW prompt live 11 minutes before the
+deploy: the rollback image reads `markup/` from the bind-mounted main checkout,
+which already held the merge. A rollback never reverts `markup/` (prompt,
+selectors, blocklist): revert the file on main for that.
+
+Second attempt `scripts/deploy.sh` (15:03:35-15:06:17): gate 46 checks,
+scrapling contract ok, Chrome 151.0.7922.108; switched 15:05:35; verified
+indeed/linkedin/wuzzuf ok/ok, naukrigulf degraded/ok (`ERR_NETWORK_CHANGED` at
+the switch, as at the last three). Image
+`rtjobs-scraper:production-4b43f80-20261024-1503`; rollback target
+`rtjobs-scraper:rollback-20261024-1503` (= 0b8347a). Schema unchanged.

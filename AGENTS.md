@@ -472,6 +472,13 @@ port and logins disabled — never the production profile directly.
   `last_alert_at`, so past alerts are not queryable there. The rule's state
   (streak, recent failures, note) is in `scrape_health_episodes`, NOT new
   `scrape_health` columns: older images INSERT into scrape_health positionally.
+- A rollback never reverts `markup/` (prompt, selectors, blocklist): it is
+  bind-mounted from the main checkout, so a merged prompt goes live at ANY
+  worker restart, a rollback included (2026-10-24 14:54: the rolled-back image
+  classified with the new prompt). Revert the file on main to undo it.
+- The gate's "boards never ok" also fires for a board that was already
+  degraded before the switch (2026-10-24: LinkedIn window_complete); only boards
+  stuck on a login count as unverified. Re-run once that board has an ok run.
 - Schema changes must keep the rollback image working: add tables, or add
   columns only to tables whose every writer (in the PREVIOUS image too) names
   its columns. Removing or renaming a column needs two deploys.
@@ -490,6 +497,12 @@ port and logins disabled — never the production profile directly.
 - DECIDED (user, 2026-10-24): no catch-up of the LinkedIn jobs missed during the
   Oct 21-24 outage; accepted loss.
 - Retention for latency_events / runs / scrape_batches / enrichment_requests.
+- LinkedIn `window_complete` gaps (2026-10-24): 13:03-14:57 Cairo every run served
+  1-2 fewer distinct IDs than `paging.total` (each gap run needed an extra, empty
+  page). The busy 14:00 hour's gaps were jobs served late (gone at 15:00, 40 of 40);
+  ONE job counted since 13:03 was never served until it left the window = possibly
+  missed. Logs cannot tell a repeat across pages from a hidden job: log per-page
+  counts and repeated IDs (no extra request) before choosing a fix. Not yet started.
 - Host Chrome (154) vs container Chrome (151): the hosted DevTools frontend can
   mismatch; use the URL printed by scripts/inspect_chrome.py.
 
@@ -598,6 +611,11 @@ port and logins disabled — never the production profile directly.
   `production-0b8347a-20261024-1033`, rollback `rollback-20261024-1033` = c7a706b):
   atomic budget file (F3), reservation release rule (F1), Indeed Turnstile
   post-click cap, Mindrift blocked. See docs/DEPLOYMENT.md.
+- 2026-10-24 15:05 Cairo: main `4b43f80` deployed (image
+  `production-4b43f80-20261024-1503`, rollback `rollback-20261024-1503` = 0b8347a):
+  monitor scrape_result confirm rule, classifier routing rules (prompt
+  `471001db34d1b320`, live from 14:57: see the rollback note in Deploy gate).
+  First attempt rolled back on a pre-existing LinkedIn window_complete gap.
 
 ## Immediate queue notifications
 - After committing a complete scrape cycle, notify `enrichment`; after committing
