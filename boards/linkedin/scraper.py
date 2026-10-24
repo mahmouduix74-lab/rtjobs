@@ -390,12 +390,17 @@ class LinkedInJobSpider(Spider):
         Pages until the IDs collected reach the first page's total. A job
         added while paging shifts later pages by one (a repeat, not a gap); a
         job removed meanwhile can hide one other job until the next run.
+        `served` (cards per page) and `repeated` (IDs an earlier page already
+        had) tell those apart from a job LinkedIn counts but never lists.
         """
         ids: list[str] = []
         cards: dict[str, dict] = {}
+        served: list[int] = []
+        repeated: list[str] = []
         total, unidentified, calls = None, 0, 0
         size = int(self.api.get("page_size", 25))
-        with timing.stage("linkedin", "job_list", lambda: {"calls": calls, "total": total, "ids": len(ids)}):
+        with timing.stage("linkedin", "job_list", lambda: {"calls": calls, "total": total, "ids": len(ids),
+                                                            "served": served, "repeated": len(repeated)}):
             for start in range(0, size * LINKEDIN_MAX_WINDOW_PAGES, size):
                 if calls:
                     await self._pause(0.3, 0.8)
@@ -421,21 +426,26 @@ class LinkedInJobSpider(Spider):
                 total = parsed["total"] if total is None else total
                 unidentified += parsed["unidentified"]
                 fresh = [key for key in parsed["ids"] if key not in cards]
+                served.append(len(parsed["ids"]))
+                repeated += [key for key in parsed["ids"] if key in cards]
                 for key in parsed["ids"]:
                     cards.setdefault(key, {}).update(parsed["cards"].get(key, {}))
                 ids += fresh
                 if not parsed["ids"] or len(ids) >= total:
                     break
         self.health.check("search_structure", True)
-        self._check_window(ids, cards, total, unidentified, calls)
+        self._check_window(ids, cards, total, unidentified, calls, served, repeated)
         return ids, cards
 
-    def _check_window(self, ids: list[str], cards: dict, total: int, unidentified: int, calls: int):
+    def _check_window(self, ids: list[str], cards: dict, total: int, unidentified: int, calls: int,
+                      served: list[int], repeated: list[str]):
         """Guardrails on a listed window: complete, time-filtered, with times."""
         cap = int(self.api.get("page_size", 25)) * LINKEDIN_MAX_WINDOW_PAGES
         self.health.check("window_complete", len(ids) >= total,
                           f"Collected {len(ids)} of the {total} jobs LinkedIn reported for the recent window in "
                           f"{calls} request(s)" + (f" (cap: {cap}; raise LINKEDIN_MAX_WINDOW_PAGES)" if total > cap else "")
+                          + f"; pages served {'+'.join(map(str, served))} cards, {len(repeated)} repeated from an earlier page"
+                          + (f" ({', '.join(repeated[:5])})" if repeated else "")
                           + ". The rest are read on later runs while they stay listed.")
         self.health.check("card_ids", not unidentified,
                           f"{unidentified} job-list entries had no job ID and were skipped (API change?).")

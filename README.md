@@ -220,6 +220,9 @@ API calls retry a network error or 5xx once; HTTP 401 (signed out) goes to the
 login check, 403/429 stop further calls for the run. LinkedIn checks:
 `search_structure` (the job list's shape), `window_complete`, `window_filter`,
 `listing_times`, `card_ids`, `detail_fetch`, `detail_content` and the job fields.
+An incomplete window (`window_complete`) reports the cards each page served and
+the IDs repeated from an earlier page, telling shifting pages from a job
+LinkedIn counts but does not list.
 Alerts retain transport codes and HTTP errors without request URLs, query
 strings, cookies or bodies. These checks cannot always identify whether the
 local network or the remote server caused a connection failure.
