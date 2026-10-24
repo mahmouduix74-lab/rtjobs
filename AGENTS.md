@@ -526,6 +526,13 @@ port and logins disabled — never the production profile directly.
   `page_setup` async/awaitable. Do not retry login/checkpoint or HTTP
   401/403/429 responses. A posting record must carry the requested job's ID
   (the API-era version of "require the requested job's title link").
+- Routing rules (user, 2026-10-24; prompt.txt): AI-training gigs follow the
+  expertise they require (only no-profession annotation -> content/ai_data_annotation);
+  selling titles -> Sales and call-center/customer-service titles -> Customer Service
+  whatever the duties lean to; office cashier -> Finance/treasury, point-of-sale ->
+  Retail; drivers/couriers -> Logistics; junk, unrelated-description and "Owner"
+  self-listing posts -> other (they had filled General Management). Short/empty/
+  boilerplate descriptions are NOT junk. Results in docs/classifier-validation.md.
 - User direction 2026-10-04: after staging tests, clean/push and enable production
   classification AND channel delivery. There are 25 named families plus `other`.
   Route only by job_family; employer_sector is analytics-only. All 26 channel

@@ -81,3 +81,42 @@ getChat and getChatMember, so they do not consume Indeed login-code updates.
 - `/tmp/rtjobs-family-validation-7084ag_c/analytics-check.json`
 
 Raw database copies and per-posting reports stay outside version control.
+
+## Routing rules update — 2026-10-24
+
+User decisions (2026-10-24): AI-training gigs follow the expertise they require;
+selling titles go to Sales and call-center/customer-service titles to Customer
+Service, whatever the duties lean to. Added to `markup/enrichment/prompt.txt`
+with them: office cashiers -> Finance/treasury (point-of-sale -> Retail, in
+restaurants/hotels -> Hospitality); drivers and couriers -> Logistics; posts that
+are not a real vacancy (junk text, a description of an unrelated role, a poster's
+own "Owner" listing) -> `other`, never General Management. A short, empty or
+boilerplate description, a title fragment, a neighboring role in the same field
+and an agency describing its client are explicitly NOT junk (the first draft sent
+five real jobs to `other`; the second draft fixed all five). `evaluation.json`
+gained 12 cases (ids 20-31) for these rules.
+
+Measured with `openai/gpt-6-luna`, production Enricher on throwaway data, version
+`471001db34d1b320` (previous `fc50eb290846c12b`):
+
+| Set | Old prompt | New prompt |
+|---|---|---|
+| 19 original synthetic cases | 76/76 assertions | 76/76 |
+| 12 new synthetic cases | 7/10 families (2 not run) | 12/12 families, 22/22 assertions |
+| 94 hand-judged real jobs (new rules as the key) | 82/94 | 92/94 |
+| production labels on the same 94 | 80/94 | — |
+
+The real jobs are 60 random plus 43 hard production jobs (Oct 15-24); the key
+follows the new rules, so the old prompt's score partly measures the policy
+change. 88/103 real jobs kept their family; 11 of the 15 changes are the new
+rules. Remaining misses: "Principal Owner" with another organization's description
+still went to General Management; "Marketing Communications Specialist" whose
+German description is a sales-development role went to `other`; a Sales
+Coordinator with order-processing duties went to Sales. A second set of 94
+production jobs from the affected categories (AI gigs, drivers, cashiers,
+sales/customer-service titles, low-confidence General Management) confirmed the
+rules (every actual driver job -> Logistics; the other 4 "driver" titles were a
+train-driver trainer, a driver recruiter, a PA-and-driver and van sales reps;
+Synthires STEM -> Science, Mercor
+finance expert -> Finance, call-center titles -> Customer Service). Cost and
+latency unchanged ($0.39 vs $0.375 per 1k jobs, same p50). Total spend $0.23.
