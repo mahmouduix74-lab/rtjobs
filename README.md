@@ -57,9 +57,10 @@ CHROME_DEBUG_PORT=9222        # remote debugging port (LinkedIn; Wuzzuf 9223, In
 CHECKPOINT_WAIT_SECONDS=600   # pause for manual 2FA/checkpoint solve
 MAX_LOGIN_RETRIES=3
 LINKEDIN_NAVIGATION_RETRY_DELAY_SECONDS=3 # three navigation attempts, with a pause
-LINKEDIN_SEARCH_RECOVERY_ATTEMPTS=1       # extra reload after an unrendered search (0-2)
-LINKEDIN_SEARCH_RECOVERY_TIMEOUT_SECONDS=30
-LINKEDIN_DETAIL_RECOVERY_TIMEOUT_SECONDS=20 # one longer detail retry
+LINKEDIN_MAX_WINDOW_PAGES=16  # job-list pages of 25 read per run (recent window)
+LINKEDIN_MAX_DETAILS_PER_RUN=40 # new-job records fetched per run; the rest next run
+LINKEDIN_QUIET_ALERT_HOURS=6  # alert when LinkedIn runs are ok but save nothing new (0 = off)
+PIPELINE_ALERT_REMIND_SECONDS=10800 # repeat a lasting monitor alert every 3 h (0 = once)
 MAX_SNAPSHOTS_PER_KIND=20
 KILL_CHROME_ON_START=false    # docker: true
 HEALTHCHECK_URL=              # optional external heartbeat sent by monitor only when pipeline checks pass
@@ -111,8 +112,8 @@ Records of every deploy: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - `ofelia` triggers the scraper container **every 3 minutes** (set
   `SCRAPE_INTERVAL_MINUTES` in `.env`; it must divide 60). Each cycle runs all
   boards in parallel (own Chrome, profile and CDP port each) and reads the
-  first search page of every board; its new jobs go to the classifier in one
-  request. A cycle that outlasts the interval starts the next one immediately.
+  first search page of every board (LinkedIn: its whole recent window, see
+  section 5); its new jobs go to the classifier in one request. A cycle that outlasts the interval starts the next one immediately.
 - Chrome runs headful on a virtual display (Xvfb, started by
   `docker/entrypoint.sh`) with remote debugging enabled.
 - Persisted in named volumes: `chrome_profile` (LinkedIn), `wuzzuf_profile`,
@@ -146,16 +147,40 @@ each browser/tab restart. A blank inspector alone does not establish that
 the scraped page or Xvfb is black; check a CDP screenshot before changing
 rendering flags.
 
-## 5. LinkedIn login behavior
+## 5. LinkedIn: how jobs are read, and login behavior
+
+Since 2026-10-21 LinkedIn's `/jobs/search/` redirects to an AI search page
+(relevance order, randomized markup), so jobs are no longer read from the page.
+Each run opens the search page (proving the session) and then, from inside that
+page, calls the same job-search API LinkedIn's web app uses:
+
+- **The whole recent window**: every job listed in the "last hour" filter,
+  25 per request until the reported total is reached (usually 1-4 requests).
+  LinkedIn counts that hour from the start of the previous clock hour, so each
+  job stays visible for 60-120 minutes: 20-40 runs see it, and a failed run (or
+  an hour of them) loses nothing.
+- **One record per new job** (title, description, company with industry and
+  about text, location, job type, workplace, listing times). Known jobs report
+  their current listing time from the list itself (repost detection).
+- **Guardrails** (the API is private): LinkedIn answers 200 even for a request
+  format it no longer knows, so every response is checked for the fields we use;
+  the window must be complete, time-filtered and carry listing times, and each
+  record must be the requested job. A record that keeps failing is saved from
+  its list card (no description) before the job can leave the window. Request
+  templates live in `markup/linkedin/selectors.json` ("api") — bind-mounted, so
+  a new LinkedIn decoration version is a file edit.
+
+Login:
 
 - Runs go **straight to the search page**; it proves the session (no login/authwall
-  path and the `li_at` cookie). Only a signed-out landing runs the login check
-  below, then the search again.
+  path and the `li_at` cookie). Only a signed-out landing (or an API 401) runs
+  the login check below, then the search again.
 - **Login page** → human-like fill (EN + AR), verify routing after submit.
 - **Checkpoint/2FA** → alert sent to the failure channel; the run **waits up
   to `CHECKPOINT_WAIT_SECONDS`** so you can solve it via CDP. The other boards
   keep their 3-minute schedule meanwhile (the cycle closes without the waiting
-  board). Solved → the run ends signed in and the next cycle scrapes LinkedIn.
+  board). Solved (also in the last seconds before the deadline) → the run ends
+  signed in and the next cycle scrapes LinkedIn.
 - **Failures** → consecutive-failure counter with escalating cooldowns
   (5m → 15m → 30m). At `MAX_LOGIN_RETRIES` the failure channel gets an alert,
   runs are skipped while blocked, and after the cooldown the profile is wiped
@@ -189,22 +214,28 @@ alerts again. Recovery is logged. All-seen pages are normal; optional salary or
 recruiter fields are not required. The checks detect common silent failures,
 not every possible semantic change in a site's data.
 Runs with failed parser checks are recorded as `degraded` with their diagnostic
-details, even if the spider completes and valid partial jobs are saved. LinkedIn
-alerts distinguish its startup/loading shell from an absent job layout and report
-whether waiting for cards or scrolling the list failed.
-LinkedIn navigation keeps three bounded attempts with a three-second pause.
-An unrendered search gets one additional reload; a slow detail gets one longer
-retry and must show the requested job's title link. Login/checkpoint pages and
-HTTP 401/403/429 stop recovery. Alerts retain transport codes, HTTP errors or
-pending-request evidence from LinkedIn and its asset host, without request URLs,
-query strings, cookies or bodies. Successful recovery is logged without a failure
-alert. These checks cannot always identify whether the local network or the remote
-server caused a connection failure.
+details, even if the spider completes and valid partial jobs are saved.
+LinkedIn navigation keeps three bounded attempts with a three-second pause. Its
+API calls retry a network error or 5xx once; HTTP 401 (signed out) goes to the
+login check, 403/429 stop further calls for the run. LinkedIn checks:
+`search_structure` (the job list's shape), `window_complete`, `window_filter`,
+`listing_times`, `card_ids`, `detail_fetch`, `detail_content` and the job fields.
+Alerts retain transport codes and HTTP errors without request URLs, query
+strings, cookies or bodies. These checks cannot always identify whether the
+local network or the remote server caused a connection failure.
+
+The separate pipeline monitor alerts board-level problems (no recent run, the
+latest run not ok, workers down, queues stuck) once per episode and then
+**every 3 hours while it lasts** (`PIPELINE_ALERT_REMIND_SECONDS`): on Oct 21-23
+LinkedIn was down 2.5 days after a single alert. It also alerts when LinkedIn's
+runs succeed but save no new job for 6 hours (`board_quiet_linkedin`; the longest
+normal gap was 3.2 h), which no parser check can see.
 
 ## 7. When the site changes (markup resilience)
 
 - Every selector lives in `markup/<site>/selectors.json` — fix selectors
-  there, no code change.
+  there, no code change. LinkedIn's API request templates (decoration IDs,
+  filters) are in the same file under `"api"`.
 - Snapshots are saved automatically for: login failures, checkpoints, empty
   search pages, login-redirects — sanitized and pruned to 20 per kind under
   `markup/<site>/snapshots/`.

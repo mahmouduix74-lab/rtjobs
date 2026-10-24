@@ -1,0 +1,56 @@
+{
+ "data": {
+  "$type": "com.linkedin.voyager.jobs.JobPosting",
+  "entityUrn": "urn:li:fs_normalized_jobPosting:4400000001",
+  "dashEntityUrn": "urn:li:fsd_jobPosting:4400000001",
+  "jobPostingId": 4400000001,
+  "title": "Data Analyst",
+  "description": {
+   "text": "Build dashboards and reports.\nSQL, Python and Power BI.",
+   "attributes": []
+  },
+  "companyDetails": {
+   "company": "urn:li:fs_normalized_company:9000001",
+   "*companyResolutionResult": "urn:li:fs_normalized_company:9000001",
+   "$type": "com.linkedin.voyager.jobs.JobPostingCompany"
+  },
+  "listedAt": "LISTED_1",
+  "originalListedAt": "ORIGINAL_1",
+  "jobState": "LISTED",
+  "formattedLocation": "Cairo, Cairo, Egypt",
+  "formattedEmploymentStatus": "Full-time",
+  "employmentStatus": "urn:li:fs_employmentStatus:FULL_TIME",
+  "workplaceTypes": [
+   "urn:li:fs_workplaceType:3"
+  ],
+  "applies": 0,
+  "views": 0
+ },
+ "included": [
+  {
+   "$type": "com.linkedin.voyager.jobs.shared.EmploymentStatus",
+   "entityUrn": "urn:li:fs_employmentStatus:FULL_TIME",
+   "localizedName": "Full-time"
+  },
+  {
+   "$type": "com.linkedin.voyager.jobs.shared.WorkplaceType",
+   "entityUrn": "urn:li:fs_workplaceType:3",
+   "localizedName": "Hybrid"
+  },
+  {
+   "$type": "com.linkedin.voyager.jobs.JobHiringTeam",
+   "entityUrn": "urn:li:fs_jobHiringTeam:4400000001",
+   "hiringTeamMembers": []
+  },
+  {
+   "$type": "com.linkedin.voyager.organization.Company",
+   "entityUrn": "urn:li:fs_normalized_company:9000001",
+   "name": "Example Analytics Co",
+   "industries": [
+    "IT Services and IT Consulting"
+   ],
+   "description": "Example Analytics Co builds reporting tools for retailers.  It was founded in 2020.",
+   "staffCount": 40
+  }
+ ]
+}

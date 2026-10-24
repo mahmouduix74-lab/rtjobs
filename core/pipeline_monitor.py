@@ -44,15 +44,29 @@ def collect_checks(now=None, started_at=None):
         for board in ('linkedin', 'wuzzuf', 'indeed', 'naukrigulf'):
             enabled = getattr(config, board.upper() + '_ENABLED')
             latest = conn.execute('SELECT status,started_at FROM runs WHERE source=? ORDER BY id DESC LIMIT 1', (board,)).fetchone()
-            completed = conn.execute("SELECT status FROM runs WHERE source=? AND status!='running' ORDER BY id DESC LIMIT 1", (board,)).fetchone()
+            completed = conn.execute("SELECT status,error FROM runs WHERE source=? AND status!='running' ORDER BY id DESC LIMIT 1", (board,)).fetchone()
             age = _age(latest['started_at'], now) if latest else None
             checks['scraper_' + board] = (bool(enabled and not grace and (age is None or age > config.PIPELINE_SCRAPER_STALE_SECONDS)),
                 f'{board}: no recent scrape start within {config.PIPELINE_SCRAPER_STALE_SECONDS}s; check scheduler, host uptime and network.')
             # Parser alerts carry snapshots. This separate check prevents a
             # recent failed scrape from being advertised as a healthy pipeline.
             # signed_in: the run signed in after waiting for you; the next cycle scrapes.
+            error = ((completed['error'] if completed else '') or '')[:300]
             checks['scrape_result_' + board] = (bool(enabled and completed and completed['status'] not in ('ok', 'signed_in')),
-                f'{board}: latest completed scrape was {completed["status"] if completed else "unobserved"}; see board alerts and logs.')
+                f'{board}: latest completed scrape was {completed["status"] if completed else "unobserved"}'
+                + (f' ({error})' if error else '') + '; see board alerts and logs.')
+            quiet_hours = config.BOARD_QUIET_ALERT_HOURS.get(board) or 0
+            if quiet_hours:
+                # Runs that "work" but find nothing new: an API/filter change
+                # can look healthy to every parser check (an empty window is valid).
+                since = (now - timedelta(hours=quiet_hours)).strftime(clock.FORMAT)
+                newest = conn.execute('SELECT MAX(scraped_at) FROM jobs WHERE source=?', (board,)).fetchone()[0]
+                ok_runs = conn.execute("SELECT COUNT(*) FROM runs WHERE source=? AND status='ok' AND started_at>=?",
+                                       (board, since)).fetchone()[0]
+                expected = quiet_hours * 60 / config.SCRAPE_INTERVAL_MINUTES
+                checks['board_quiet_' + board] = (bool(enabled and ok_runs * 2 >= expected and (not newest or newest < since)),
+                    f'{board}: no new job saved for {quiet_hours:g} h although {ok_runs} runs completed ok in that time. '
+                    'The search may be returning nothing new (filter, location or API change); normal gaps stay under ~3 h.')
         # A cycle still scraping (e.g. holding for a 2FA/code solve) is not yet
         # classifier work, and held-back cycles have their own check below.
         pending = conn.execute("SELECT COUNT(*) AS n,MIN(e.created_at) AS oldest,MAX(e.attempts) AS attempts "
@@ -99,8 +113,14 @@ def collect_checks(now=None, started_at=None):
     return checks
 
 
+# Expected to last until its known end (the next budget window): no reminders.
+_NO_REMINDER = {'classifier_budget'}
+
+
 def report_checks(checks, now=None):
-    """One successful alert per failure episode; retry failed sends after restart."""
+    """One alert per failure episode, then a "still failing" reminder every
+    PIPELINE_ALERT_REMIND_SECONDS while it lasts; failed sends are retried
+    (also after a restart)."""
     now = now or clock.utcnow()
     stamp = now.strftime(clock.FORMAT)
     for name, (failing, detail) in checks.items():
@@ -114,15 +134,25 @@ def report_checks(checks, now=None):
                 'failing=excluded.failing,detail=excluded.detail,first_seen_at=excluded.first_seen_at,last_seen_at=excluded.last_seen_at,'
                 'last_alert_at=excluded.last_alert_at,next_alert_at=excluded.next_alert_at',
                 (name, int(failing), detail, first, stamp, alerted, next_at))
-        if not failing or alerted or next_at > stamp:
+        remind = bool(failing and alerted and config.PIPELINE_ALERT_REMIND_SECONDS and name not in _NO_REMINDER
+                      and (_age(alerted, now) or 0) >= config.PIPELINE_ALERT_REMIND_SECONDS)
+        if not failing or (alerted and not remind) or next_at > stamp:
             continue
+        subject, text = 'Pipeline: ' + name, detail
+        if remind:
+            hours = (_age(first, now) or 0) / 3600
+            subject = 'Pipeline: still failing — ' + name
+            text = f'Failing since {clock.to_local(first)} (local time, {hours:.0f} h). {detail}'
         # Network I/O must never hold a SQLite write transaction.
-        sent = telegram.notify_failure('Pipeline: ' + name, detail,
-            hint='Check enrichment, delivery, monitor and scheduler logs. Saved raw jobs and pending work are retained.')
+        sent = telegram.notify_failure(subject, text,
+            hint='Check enrichment, delivery, monitor and scheduler logs. Saved raw jobs and pending work are retained.'
+                 + (f' Repeats every {config.PIPELINE_ALERT_REMIND_SECONDS // 3600} h until it recovers.'
+                    if config.PIPELINE_ALERT_REMIND_SECONDS and name not in _NO_REMINDER else ''))
         retry = (now + timedelta(seconds=config.PIPELINE_ALERT_RETRY_SECONDS)).strftime(clock.FORMAT)
         with db.get_db() as conn:
+            # A failed reminder keeps the episode's earlier alert time.
             conn.execute('UPDATE pipeline_alerts SET last_alert_at=?,next_alert_at=? WHERE check_name=?',
-                         (stamp if sent else None, '' if sent else retry, name))
+                         (stamp if sent else alerted, '' if sent else retry, name))
 
 
 def monitor_once(now=None, started_at=None, dry_run=False):

@@ -349,8 +349,49 @@ def main():
             with patch.object(telegram, 'notify_failure') as send:
                 monitor.monitor_once(dry_run=True)
                 assert not send.called
+            # A lasting failure is reminded every PIPELINE_ALERT_REMIND_SECONDS
+            # (Oct 21-23: LinkedIn was down 2.5 days after ONE alert); a failed
+            # reminder is retried; the budget pause (known end) never reminds.
+            start = clock.utcnow(); remind = timedelta(seconds=config.PIPELINE_ALERT_REMIND_SECONDS)
+            retry = timedelta(seconds=config.PIPELINE_ALERT_RETRY_SECONDS + 1)
+            with patch.object(telegram, 'notify_failure', side_effect=[True, False, True, True]) as alert:
+                monitor.report_checks({'lasting': (True, 'down')}, start)
+                monitor.report_checks({'lasting': (True, 'down')}, start + remind - timedelta(seconds=1))
+                assert alert.call_count == 1
+                monitor.report_checks({'lasting': (True, 'down')}, start + remind)
+                assert alert.call_count == 2 and 'still failing' in alert.call_args.args[0]
+                monitor.report_checks({'lasting': (True, 'down')}, start + remind + timedelta(seconds=1))
+                assert alert.call_count == 2, 'a failed reminder waits for the retry delay'
+                monitor.report_checks({'lasting': (True, 'down')}, start + remind + retry)
+                assert alert.call_count == 3 and 'Failing since' in alert.call_args.args[1]
+                monitor.report_checks({'classifier_budget': (True, 'paused')}, start)
+                monitor.report_checks({'classifier_budget': (True, 'paused')}, start + remind * 2)
+                assert alert.call_count == 4
+            # A board whose runs complete ok but save nothing new for hours is
+            # alerted; a board that only just started is not.
+            now = clock.utcnow()
+            stamp = lambda minutes: (now - timedelta(minutes=minutes)).strftime(clock.FORMAT)
+            with patch.object(config, 'LINKEDIN_ENABLED', True), patch.object(config, 'BOARD_QUIET_ALERT_HOURS', {'linkedin': 6}):
+                with db.get_db() as conn:
+                    conn.executemany("INSERT INTO runs (source,status,started_at,finished_at) VALUES ('linkedin','ok',?,?)",
+                                     [(stamp(3 * n), stamp(3 * n)) for n in range(15)])
+                    conn.execute("INSERT INTO jobs (source,external_id,title,scraped_at) VALUES ('linkedin','old','Old',?)", (stamp(60 * 7),))
+                checks = monitor.collect_checks(now=now)
+                assert not checks['board_quiet_linkedin'][0], 'only 15 ok runs: just (re)started'
+                with db.get_db() as conn:
+                    conn.executemany("INSERT INTO runs (source,status,started_at,finished_at) VALUES ('linkedin','ok',?,?)",
+                                     [(stamp(3 * n), stamp(3 * n)) for n in range(15, 119)])
+                checks = monitor.collect_checks(now=now)
+                assert checks['board_quiet_linkedin'][0] and 'no new job saved for 6 h' in checks['board_quiet_linkedin'][1]
+                assert 'board_quiet_wuzzuf' not in checks
+                with db.get_db() as conn:
+                    conn.execute("INSERT INTO jobs (source,external_id,title,scraped_at) VALUES ('linkedin','new','New',?)", (stamp(60),))
+                assert not monitor.collect_checks(now=now)['board_quiet_linkedin'][0]
+                with db.get_db() as conn:
+                    conn.execute("DELETE FROM jobs WHERE source='linkedin'")
+                    conn.execute("DELETE FROM runs WHERE source='linkedin'")
             client.close(); fresh.close()
-            print('PASS monitor stale heartbeats, persistent alert episodes, failed-send retry, dry run and degraded heartbeat suppression')
+            print('PASS monitor stale heartbeats, persistent alert episodes, failed-send retry, 3-hourly reminders, quiet-board check, dry run and degraded heartbeat suppression')
 
 
 if __name__ == '__main__':

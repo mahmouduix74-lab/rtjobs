@@ -79,21 +79,18 @@ LINKEDIN_NAVIGATION_RETRY_DELAY_SECONDS = int(os.environ.get("LINKEDIN_NAVIGATIO
 if not 1 <= LINKEDIN_NAVIGATION_RETRY_DELAY_SECONDS <= 30:
     raise ValueError("LINKEDIN_NAVIGATION_RETRY_DELAY_SECONDS must be between 1 and 30")
 
-# One bounded recovery navigation after the search fails to render. This is
-# additional to scrapling's navigation retries; 0 disables the extra attempt.
-LINKEDIN_SEARCH_RECOVERY_ATTEMPTS = int(os.environ.get("LINKEDIN_SEARCH_RECOVERY_ATTEMPTS", "1"))
-LINKEDIN_SEARCH_RECOVERY_TIMEOUT_SECONDS = int(os.environ.get("LINKEDIN_SEARCH_RECOVERY_TIMEOUT_SECONDS", "30"))
-LINKEDIN_DETAIL_RECOVERY_TIMEOUT_SECONDS = int(os.environ.get("LINKEDIN_DETAIL_RECOVERY_TIMEOUT_SECONDS", "20"))
-# Extra wait (once per search) while LinkedIn's app bundle is still
-# downloading: a reload restarts it, so on a slow link it never finished and
-# never reached the HTTP cache (Oct 9). Bounded by BOARD_TIME_BUDGET_SECONDS.
-LINKEDIN_SLOW_ASSET_WAIT_SECONDS = int(os.environ.get("LINKEDIN_SLOW_ASSET_WAIT_SECONDS", "90"))
-if not 0 <= LINKEDIN_SEARCH_RECOVERY_ATTEMPTS <= 2:
-    raise ValueError("LINKEDIN_SEARCH_RECOVERY_ATTEMPTS must be between 0 and 2")
-if not 1 <= LINKEDIN_SEARCH_RECOVERY_TIMEOUT_SECONDS <= 60:
-    raise ValueError("LINKEDIN_SEARCH_RECOVERY_TIMEOUT_SECONDS must be between 1 and 60")
-if not 1 <= LINKEDIN_DETAIL_RECOVERY_TIMEOUT_SECONDS <= 60:
-    raise ValueError("LINKEDIN_DETAIL_RECOVERY_TIMEOUT_SECONDS must be between 1 and 60")
+# The recent window (boards/linkedin/scraper.py) is read in pages of 25; 16
+# pages cover 400 jobs, about 3x a weekday's busiest two hours. A larger
+# window alerts (window_complete) and its remainder is read on later runs.
+LINKEDIN_MAX_WINDOW_PAGES = int(os.environ.get("LINKEDIN_MAX_WINDOW_PAGES", "16"))
+# Posting records fetched per run (oldest listing first). Steady state is 1-5
+# per run; after an outage the window's backlog is read over a few runs
+# instead of one burst (the old page flow opened at most 25 per run).
+LINKEDIN_MAX_DETAILS_PER_RUN = int(os.environ.get("LINKEDIN_MAX_DETAILS_PER_RUN", "40"))
+if not 1 <= LINKEDIN_MAX_WINDOW_PAGES <= 40:
+    raise ValueError("LINKEDIN_MAX_WINDOW_PAGES must be between 1 and 40")
+if not 1 <= LINKEDIN_MAX_DETAILS_PER_RUN <= 200:
+    raise ValueError("LINKEDIN_MAX_DETAILS_PER_RUN must be between 1 and 200")
 
 # How long (seconds) to keep the browser open waiting for a manual
 # checkpoint/2FA solve via CDP before aborting the run.
@@ -227,6 +224,16 @@ PIPELINE_SCRAPER_STALE_SECONDS = int(os.environ.get("PIPELINE_SCRAPER_STALE_SECO
 PIPELINE_DELIVERY_ALERT_ATTEMPTS = int(os.environ.get("PIPELINE_DELIVERY_ALERT_ATTEMPTS", "3"))
 PIPELINE_ALERT_RETRY_SECONDS = int(os.environ.get("PIPELINE_ALERT_RETRY_SECONDS", "300"))
 PIPELINE_STARTUP_GRACE_SECONDS = int(os.environ.get("PIPELINE_STARTUP_GRACE_SECONDS", "180"))
+# A failure that lasts is alerted again every N seconds ("still failing"; 0 =
+# once per episode). Oct 21-23: LinkedIn was down 2.5 days after ONE alert.
+PIPELINE_ALERT_REMIND_SECONDS = int(os.environ.get("PIPELINE_ALERT_REMIND_SECONDS", "10800"))
+if PIPELINE_ALERT_REMIND_SECONDS < 0:
+    raise ValueError("PIPELINE_ALERT_REMIND_SECONDS must be nonnegative")
+# A board whose runs complete ok but save no new job for this many hours is
+# alerted (board_quiet_<board>): the search may return nothing new after a
+# filter/location/API change. LinkedIn's longest normal gap Sep 25-Oct 20 was
+# 3.2 h; the other boards have natural gaps of 7-20 h, so only LinkedIn.
+BOARD_QUIET_ALERT_HOURS = {"linkedin": float(os.environ.get("LINKEDIN_QUIET_ALERT_HOURS", "6"))}
 
 # Reject invalid bounds before a worker can issue paid requests or busy-loop.
 for _name in ("CLASSIFIER_TIMEOUT_SECONDS", "CLASSIFIER_MAX_OUTPUT_TOKENS",

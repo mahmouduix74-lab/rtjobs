@@ -117,6 +117,16 @@ def _handle_checkpoint(page, selectors: dict) -> bool:
             if _is_logged_in(page):
                 logger.info("[login] Checkpoint solved — resuming.")
                 return True
+        # A solve in the last seconds is still a solve (Oct 23: solved at the
+        # deadline, the page was on /feed one second later, and the run still
+        # counted a failure and cooled down 30 minutes).
+        try:
+            page.wait_for_url(_FEED_OK, timeout=10_000, wait_until="commit")
+        except Exception:
+            pass
+        if _is_logged_in(page):
+            logger.info("[login] Checkpoint solved at the deadline — resuming.")
+            return True
 
     logger.warning("[login] Checkpoint not solved in time — aborting run.")
     notify_failure(
