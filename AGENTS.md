@@ -470,8 +470,8 @@ port and logins disabled — never the production profile directly.
   median 1, p99 4, max 10 per run); Gotchas #4 stands. Reliability work goes
   into not losing runs (immediate saves, fewer failure points) instead.
   (2026-10-24: LinkedIn now reads its whole recent window anyway, Gotchas #13.)
-- Optional, asked 2026-10-23: one-time catch-up of the LinkedIn jobs missed
-  during the Oct 21-24 outage (the search API reaches back ~24 h, max 1,000).
+- DECIDED (user, 2026-10-24): no catch-up of the LinkedIn jobs missed during the
+  Oct 21-24 outage; accepted loss.
 - Retention for latency_events / runs / scrape_batches / enrichment_requests.
 - Host Chrome (154) vs container Chrome (151): the hosted DevTools frontend can
   mismatch; use the URL printed by scripts/inspect_chrome.py.
