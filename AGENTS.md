@@ -601,6 +601,12 @@ port and logins disabled — never the production profile directly.
   still be billed), connection-level failures release it. Previously every
   failed attempt kept its ~$0.02 reservation and ~45 flaky attempts leaked
   ~$0.95 of the $1 daily budget, deferring 200 jobs to midnight.
+  2026-10-24 (code review F1): the release rule is "the provider provably did
+  not bill": nothing sent (`classify.RequestNotSent`, e.g. no API key; a
+  connection failure; the request's audit row failed to write) or an HTTP
+  error status. Timeouts, broken bodies and 2xx answers that fail validation
+  keep the reservation. A kept reservation is never lost money, but enough of
+  them pause classification until midnight (`daily_budget_exhausted`).
 - Latency instrumentation is mandatory infrastructure, not optional logging:
   `core/timing.py` (`stage`/`timed`/`record`) writes one `latency_events` row
   + one parseable `LATENCY source=.. stage=.. seconds=..` INFO line per stage

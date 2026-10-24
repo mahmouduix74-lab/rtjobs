@@ -13,6 +13,7 @@ import logging
 import math
 from pathlib import Path
 import signal
+import sqlite3
 import threading
 import uuid
 
@@ -23,7 +24,7 @@ from config import (DB_PATH, ENRICHMENT_ENABLED, CLASSIFIER_MODEL,
                     CLASSIFIER_VALIDATION_RETRY_MAX_SECONDS, ENRICHMENT_POLL_SECONDS,
                     CLASSIFIER_ALERT_AFTER_FAILURES)
 from core import clock, db, timing
-from core.classify import Enricher, EnrichmentError, OutputValidationError
+from core.classify import Enricher, EnrichmentError, OutputValidationError, RequestNotSent
 from core.log import setup_logging
 from core.wakeup import Wakeup
 
@@ -159,7 +160,11 @@ def process_batch(client: Enricher, jobs: list[dict], preview: bool = False) -> 
                 else:
                     request_id = uuid.uuid4().hex
                     report.update(request_id=request_id, api_calls=1)
-                    db.start_enrichment_request(request_id, outstanding[0].get('batch_id'), [job['id'] for job in outstanding])
+                    try:
+                        db.start_enrichment_request(request_id, outstanding[0].get('batch_id'), [job['id'] for job in outstanding])
+                    except sqlite3.Error:
+                        db.reconcile_enrichment_spend(day, bound, 0)  # nothing was sent
+                        raise
                     stage = 'classify'
                     logger.info('Enrichment request=%s cycle=%s jobs=%s cached_jobs=%s',
                                 request_id, outstanding[0].get('batch_id'), len(outstanding), len(cached))
@@ -187,16 +192,20 @@ def process_batch(client: Enricher, jobs: list[dict], preview: bool = False) -> 
                                      cached=False, error='') for result in results)
             except (EnrichmentError, requests.RequestException, ValueError, TypeError, KeyError) as exc:
                 usage = getattr(exc, 'usage', None) or usage
+                status = getattr(exc, 'status_code', None) or getattr(getattr(exc, 'response', None), 'status_code', None)
                 if request_id:
-                    # A connection-level failure proves the request never
-                    # reached the provider, so release its whole reservation;
-                    # repeated offline attempts must not exhaust the daily
-                    # budget. Timeouts keep theirs (a timeout may still be
-                    # performed and billed by the provider).
-                    if isinstance(exc, requests.ConnectionError) and not _billed(usage):
+                    # Release the whole reservation when the provider provably
+                    # did not bill: nothing was sent (no API key; a connection-
+                    # level failure, so repeated offline attempts cannot
+                    # exhaust the daily budget) or it answered with an error
+                    # status. Timeouts, broken response bodies and 2xx answers
+                    # that fail validation keep it: the provider may have
+                    # performed and billed the request. A kept reservation
+                    # pauses classification until midnight once the day's
+                    # budget looks spent.
+                    if not _billed(usage) and (status or isinstance(exc, (RequestNotSent, requests.ConnectionError))):
                         usage = {'cost': 0}
                     _reconcile(day, bound, usage)
-                status = getattr(exc, 'status_code', None) or getattr(getattr(exc, 'response', None), 'status_code', None)
                 # Do not expose response text, URLs with credentials or raw jobs.
                 error = (('OpenRouter HTTP ' + str(status)) if status else
                          str(exc)[:1000] if isinstance(exc, EnrichmentError) else

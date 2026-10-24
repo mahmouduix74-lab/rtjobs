@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -180,6 +181,40 @@ def main():
                 after = conn.execute('SELECT amount FROM enrichment_spend').fetchone()[0]
             assert abs(after - (before + .01)) < 1e-8, f'Recovery spend wrong: {after} != {before}+.01'
             print('PASS connection-level failures release reservations; recovery classifies the offline backlog')
+
+            # The same for every failure the provider provably did not bill
+            # (nothing sent, or an error status); a timeout or a 2xx answer
+            # that fails validation may have been billed and keeps its share.
+            cycle_unbilled = db.start_scrape_batch(); save(2, 'unbilled'); db.finish_scrape_batch(cycle_unbilled)
+            unbilled_jobs = batch_jobs(cycle_unbilled)
+            def spent():
+                with db.get_db() as conn:
+                    return conn.execute('SELECT SUM(amount) FROM enrichment_spend').fetchone()[0]
+            def attempt(**post):
+                db.set_pipeline_state('classifier', {})
+                with patch.object(client, 'request_bound', return_value=.5), patch.object(client.session, 'post', **post):
+                    return worker.process_batch(client, unbilled_jobs)
+            before = spent()
+            for status in (429, 502):
+                failed = attempt(return_value=SimpleNamespace(ok=False, status_code=status))
+                assert failed['jobs'][0]['error'] == f'OpenRouter HTTP {status}'
+            with patch.object(classify, 'OPENROUTER_API_KEY', ''):
+                failed = attempt(side_effect=AssertionError('no request without a key'))
+            assert failed['jobs'][0]['error'] == 'OpenRouter API key is missing'
+            with patch.object(db, 'start_enrichment_request', side_effect=sqlite3.OperationalError('database is locked')):
+                try:
+                    attempt(side_effect=AssertionError('no request without its audit row'))
+                    raise AssertionError('a database error must not be swallowed')
+                except sqlite3.OperationalError:
+                    pass
+            assert abs(spent() - before) < 1e-8, f'Unbilled failures kept their reservation: {before} -> {spent()}'
+            attempt(side_effect=requests.Timeout('slow'))
+            assert abs(spent() - (before + .5)) < 1e-8, 'a timeout may have been billed: it keeps its reservation'
+            attempt(return_value=SimpleNamespace(ok=True, json=lambda: {'choices': []}))
+            assert abs(spent() - (before + 1)) < 1e-8, 'a 2xx answer may have been billed: it keeps its reservation'
+            db.reconcile_enrichment_spend(datetime.now().strftime('%Y-%m-%d'), 1, 0)
+            db.set_pipeline_state('classifier', {})
+            print('PASS unbilled failures (error status, no API key, no audit row) release reservations; timeouts and 2xx keep them')
 
             # Cycles that can never fit one request are held for free (no
             # global pause); a known context window clamps max_tokens.
