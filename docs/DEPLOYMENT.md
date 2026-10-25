@@ -314,7 +314,10 @@ Three branches from the code review triage, each tested on its own, then merged
   HTTP error status); timeouts and 2xx answers keep it (review F1).
 - `latency/indeed-turnstile-cap` (`00b51f8`): the Cloudflare solver's post-click
   network-idle wait is capped at 10s (was the 120s page default: 321 of 361
-  Indeed solves Oct 14-24 took 115-125s and held the cycle).
+  Indeed solves Oct 9-22 took 115-125s and held the cycle). Indeed's
+  never-idle page stopped on its own Oct 22 14:57 (solves 3-8s since), so
+  production had no 2-minute solve to cut after the deploy; the offline test
+  drives scrapling's real solver through the capped wait.
 Also on main: Mindrift blocked on every board (`4d3ab97`, live via the bind
 mount since 10:10, before this deploy).
 
@@ -324,3 +327,85 @@ naukrigulf degraded/ok (first run `ERR_NETWORK_CHANGED` during the container
 switch, as at the last two switches; next run ok, no alert). Image
 `rtjobs-scraper:production-0b8347a-20261024-1033`; rollback target
 `rtjobs-scraper:rollback-20261024-1033` (= c7a706b). Schema unchanged.
+
+## 2026-10-24 15:05 Cairo: monitor confirm rule + classifier routing rules (`4b43f80`)
+
+Two branches, each tested on its own, then merged (offline suite passed on the
+merged tree):
+- `reliability/monitor-confirm-twice` (`50d036c`): the monitor's
+  `scrape_result_<board>` alert follows the board checks' confirm rule (last 2
+  completed runs bad, or 3 bad runs in the hour, latest still bad). 10:51 one
+  degraded LinkedIn run (window_complete 27 of 28) alerted although the next
+  run healed it.
+- `classify/prompt-rules` (`5192758`, prompt version `471001db34d1b320`, was
+  `fc50eb290846c12b`): the user's routing rules (AI-training gigs by expertise,
+  selling titles -> Sales, call-center/CS titles -> Customer Service, cashiers,
+  drivers, junk posts -> other/Low). Paid eval: 92/94 hand-judged real jobs (old
+  prompt 82/94), 12/12 new synthetic cases. See docs/classifier-validation.md.
+
+First attempt (14:50-14:54) ROLLED BACK: "boards never ok: linkedin
+degraded/degraded". Not caused by the change: production LinkedIn had been
+`degraded` on every run since 13:03 (window_complete: LinkedIn's total ran 1-2
+ahead of the distinct IDs its pages served; alerted 13:06). It healed at the
+15:00 hour boundary (40 of 40). The gate treats only boards stuck on a login
+before the switch as "unverified", so a board already degraded before the
+switch blocks a deploy until it has an ok run again.
+
+The rollback restart (14:54) put the NEW prompt live 11 minutes before the
+deploy: the rollback image reads `markup/` from the bind-mounted main checkout,
+which already held the merge. A rollback never reverts `markup/` (prompt,
+selectors, blocklist): revert the file on main for that.
+
+Second attempt `scripts/deploy.sh` (15:03:35-15:06:17): gate 46 checks,
+scrapling contract ok, Chrome 151.0.7922.108; switched 15:05:35; verified
+indeed/linkedin/wuzzuf ok/ok, naukrigulf degraded/ok (`ERR_NETWORK_CHANGED` at
+the switch, as at the last three). Image
+`rtjobs-scraper:production-4b43f80-20261024-1503`; rollback target
+`rtjobs-scraper:rollback-20261024-1503` (= 0b8347a). Schema unchanged.
+
+## 2026-10-24 15:35 Cairo: LinkedIn window diagnostics (`65113da`)
+
+`reliability/linkedin-window-diagnostics` (`f24cc21`): the window_complete
+detail and the `job_list` latency row carry the cards each page served and the
+IDs repeated from an earlier page (`served`, `repeated`), to tell shifting pages
+from a job LinkedIn counts but does not list (13:03-14:57 gaps, see AGENTS
+backlog). No extra requests. First rows: `served [25, 25, 3], repeated 0`.
+
+`scripts/deploy.sh` (15:33:01-15:36:13): gate 46 checks, scrapling contract ok,
+Chrome 151.0.7922.108; switched 15:35:10; verified, naukrigulf degraded/ok
+(`ERR_NETWORK_CHANGED` at the switch). That was NaukriGulf's 4th switch failure
+within an hour (14:52, 14:54, 15:05, 15:35): one `search_fetch` alert, deployed
+before 16:06 on the user's call. Image
+`rtjobs-scraper:production-65113da-20261024-1533`; rollback target
+`rtjobs-scraper:rollback-20261024-1533` (= 4b43f80). Schema unchanged.
+
+## 2026-10-24 15:50 Cairo: old images and local leftovers removed
+
+Kept: `production-65113da-20261024-1533` (live), rollback targets
+`rollback-20261024-1533` (= 4b43f80), `rollback-20261024-1503` (= 0b8347a),
+`rollback-20261024-1033` (= c7a706b), `rtjobs-chrome-base:151.0.7922.108` and
+its `python:3.13-slim` base. Every older RTJobs image (Oct 3-10; none can read
+LinkedIn's AI search page) was deleted, so the rollback tags named in the
+records above, older than c7a706b, no longer exist. Images 14.3 GB -> 2.1 GB.
+Also deleted from the checkout (all git-ignored, unused by production, which
+mounts named volumes): `chromeprofile/` and `wuzzufprofile/` (pre-Docker
+profiles, Sep 4), `artifacts/` (Oct 4 pre-deploy DB copy + staging),
+`exports/jobs.json` (Sep 25 dump). `jobnetworkminiapp/` stays (user).
+
+## 2026-10-24 16:44 Cairo: LinkedIn count-ahead, NaukriGulf network retry, cleanup + ruff (`a89c078`)
+
+- `reliability/linkedin-count-ahead` (`8827a67`): a list that ended with no
+  repeats and at most 3 short of `paging.total` is LinkedIn counting jobs it
+  does not list yet: one relevance-order page looks for them and the window
+  counts as complete (no alert). Live at once: 64 of 65 and 65 of 66 ok,
+  probe served 25, found none.
+- `reliability/naukrigulf-network-retry` (`9047240`): one more visit after
+  `ERR_NETWORK_CHANGED` only. This switch did not hit the error (first run
+  ok), so the retry is verified offline only so far.
+- Also first deployed here: dead-code cleanup and ruff (`8c2d5b6`; no runtime
+  change). deploy.sh's new lint step ran clean.
+
+`scripts/deploy.sh` (16:39:58-16:45:26): gate 46 checks, scrapling contract
+ok, Chrome 151.0.7922.108; switched 16:44:32; verified all four boards ok/ok.
+Image `rtjobs-scraper:production-a89c078-20261024-1639`; rollback target
+`rtjobs-scraper:rollback-20261024-1639` (= 65113da). Schema unchanged.

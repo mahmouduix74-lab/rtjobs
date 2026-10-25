@@ -15,7 +15,9 @@ live debugging / manual 2FA solves.
 source .venv/bin/activate.fish      # shell is fish; venv is Python 3.14
 python main.py                      # run all enabled boards
 python main.py --reset-login        # clear LinkedIn retry/cooldown state
-python -m py_compile <files...>     # no linter/typechecker configured — compile check + offline tests are the verification loop
+python -m py_compile <files...>     # compile check; with ruff + the offline tests this is the verification loop
+.venv/bin/ruff check .              # lint for bugs (ruff.toml; pyflakes + bugbear, not style); deploy.sh runs it first
+.venv/bin/pip install -r requirements-dev.txt  # dev tools (ruff), never in the image
 scripts/deploy.sh                   # THE way to deploy main: gate in the candidate image, quiet-moment switch, auto-rollback
 scripts/deploy.sh --dry-run         # build + gate only (any branch); production untouched
 scripts/build_chrome_base.sh        # (re)build the pinned Chrome base image; --upgrade fetches a new Chrome on purpose
@@ -217,6 +219,12 @@ description, link, extra(dict), scraped_at`.
        start of the previous clock hour (60-120 min), measured 73 jobs at 19:55
        -> 34 at 20:00. DD is only roughly sorted (page 2 can start newer than
        page 1's tail) — never assume "page 1 = newest".
+       `paging.total` can run AHEAD of the list (2026-10-24): a new job is counted
+       minutes before its card is served, and one job counted for 2 h was never
+       served. A list that ended (short page) with no repeats and <= 3 short
+       (`_COUNT_AHEAD_MAX`) is that: one page in relevance order (`sortBy:List(R)`,
+       derived from cards_url) looks for the missing jobs (found ones are read as
+       usual), logged, no alert. Repeats or bigger gaps still fail window_complete.
     b. Record per NEW id: `/voyager/api/jobs/jobPostings/<id>?decorationId=
        com.linkedin.voyager.deco.jobs.web.shared.WebFullJobPosting-65`: title,
        description.text, listedAt/originalListedAt, jobState, formattedLocation,
@@ -350,8 +358,9 @@ Set dummy env before importing config in test scripts:
   cycle first if it has no current result). Latency reports exclude reposts.
 - Company blocklist: `markup/blocked_companies.json` (bind-mounted, so
   live-editable without rebuild). Keyed by source + `"*"` for all sources;
-  case-insensitive substring match (`core/blocklist.py`). Blocked jobs are
-  `db.mark_seen`'d (never re-scraped) but never saved/notified.
+  case-insensitive substring match (`core/blocklist.py`). Blocked jobs go into
+  `seen_ids` (`db.save_jobs(accepted, blocked)`: never re-scraped) but are never
+  saved/notified.
 - Snapshots via `markup.save_snapshot(site, kind, html)` on every
   suspicious page (login failure, checkpoint, empty results, redirects).
 - Failures -> `telegram.notify_failure(subject, detail, snapshot, hint)`;
@@ -425,8 +434,9 @@ port and logins disabled — never the production profile directly.
   for a challenge or unreadable page.
 - (2026-10-24, branch `latency/indeed-turnstile-cap`) After clicking the
   Turnstile box the solver waited for networkidle with NO timeout = the page
-  default (Indeed: 120s); Indeed never goes idle, so 321 of 361 Indeed solves
-  Oct 14-24 took 115-125s and held the whole cycle. The real solver now runs
+  default (Indeed: 120s); Indeed never went idle, so 321 of 361 Indeed solves
+  Oct 9-22 took 115-125s and held the whole cycle (it stopped on Indeed's side
+  Oct 22 14:57 Cairo, solves 3-8s since; the cap guards a return). The real solver now runs
   against `core.browser._SolverView`, which caps that wait at
   `_CF_CLICK_IDLE_MS` (10s); the solver's own 10s clear-poll and retry follow
   unchanged. Same bug in scrapling 0.5 (upstream #524): keep the cap there.
@@ -454,7 +464,12 @@ port and logins disabled — never the production profile directly.
 - Monitor alerts (core/pipeline_monitor.py, 2026-10-24): a lasting failure is
   re-sent every PIPELINE_ALERT_REMIND_SECONDS (3 h; "Pipeline: still failing —
   <check>", except classifier_budget) — Oct 21-23 LinkedIn was down 2.5 days
-  after ONE alert. `scrape_result_<board>` now includes the run's error text.
+  after ONE alert. `scrape_result_<board>` now includes the run's error text, and
+  (branch `reliability/monitor-confirm-twice`, 2026-10-24) follows the board checks'
+  confirm rule: it fails only when the last CONFIRM_STREAK (2) completed runs are not
+  ok, or FLAP_FAILURES (3) runs within the hour were, and the latest is still bad.
+  Before, ONE degraded run alerted whenever the monitor polled before the next run
+  finished (10:51 LinkedIn window_complete 27 of 28, healed at 10:54, nothing lost).
   `board_quiet_<board>` (LinkedIn only, LINKEDIN_QUIET_ALERT_HOURS=6): runs ok
   (>= half the expected count) but no new job saved for 6 h — catches a search
   that silently returns nothing new (longest normal gap Sep 25-Oct 20: 3.2 h).
@@ -466,6 +481,13 @@ port and logins disabled — never the production profile directly.
   `last_alert_at`, so past alerts are not queryable there. The rule's state
   (streak, recent failures, note) is in `scrape_health_episodes`, NOT new
   `scrape_health` columns: older images INSERT into scrape_health positionally.
+- A rollback never reverts `markup/` (prompt, selectors, blocklist): it is
+  bind-mounted from the main checkout, so a merged prompt goes live at ANY
+  worker restart, a rollback included (2026-10-24 14:54: the rolled-back image
+  classified with the new prompt). Revert the file on main to undo it.
+- The gate's "boards never ok" also fires for a board that was already
+  degraded before the switch (2026-10-24: LinkedIn window_complete); only boards
+  stuck on a login count as unverified. Re-run once that board has an ok run.
 - Schema changes must keep the rollback image working: add tables, or add
   columns only to tables whose every writer (in the PREVIOUS image too) names
   its columns. Removing or renaming a column needs two deploys.
@@ -484,14 +506,21 @@ port and logins disabled — never the production profile directly.
 - DECIDED (user, 2026-10-24): no catch-up of the LinkedIn jobs missed during the
   Oct 21-24 outage; accepted loss.
 - Retention for latency_events / runs / scrape_batches / enrichment_requests.
-- Monitor `scrape_result_<board>` (core/pipeline_monitor.py) alerts on ONE degraded
-  run whenever the monitor polls before the next run completes, bypassing the
-  confirm-twice rule of the board checks: 2026-10-24 10:51 LinkedIn sent "latest
-  completed scrape was degraded" for window_complete 27 of 28 (LinkedIn's total ran
-  ahead of its pages), healed by the 10:54 run with nothing lost; NaukriGulf's
-  degraded run at the deploy switch stayed silent only because it healed in 23s.
-  Fix: failing only when the last TWO completed runs are not ok. User: noted, not
-  yet (2026-10-24).
+- LinkedIn `window_complete` gaps (2026-10-24): 13:03-14:57 Cairo every run served
+  1-2 fewer distinct IDs than `paging.total` (each gap run needed an extra, empty
+  page). The busy 14:00 hour's gaps were jobs served late (gone at 15:00, 40 of 40);
+  ONE job counted since 13:03 was never served until it left the window = possibly
+  missed. Logs could not tell a repeat across pages from a hidden job; branch
+  `reliability/linkedin-window-diagnostics` adds per-page card counts and repeated
+  IDs (no extra request) to the window_complete detail and the `job_list` latency
+  row (`served`, `repeated`), live 2026-10-24 15:35. Repeats = pages shift (fix: overlapping pages); none and
+  served < total = LinkedIn counts a job it does not list (needs another query).
+  ANSWER (15:42-15:45, first gap after the deploy): `served [25,25,4,0]` /
+  `[25,25,5,0]`, 0 repeated, total one higher = LinkedIn counts a job it does not
+  list. Our paging cannot reach it; finding it needs a second query (another sort).
+  DONE (`a89c078`, live 2026-10-24 16:44; Gotchas #13a): such gaps no longer
+  alert, and one relevance-order page looks for the job. Check its `probe` field in the
+  job_list latency rows: `found` non-empty = jobs the date order hid, now saved.
 - Host Chrome (154) vs container Chrome (151): the hosted DevTools frontend can
   mismatch; use the URL printed by scripts/inspect_chrome.py.
 
@@ -525,6 +554,13 @@ port and logins disabled — never the production profile directly.
   `page_setup` async/awaitable. Do not retry login/checkpoint or HTTP
   401/403/429 responses. A posting record must carry the requested job's ID
   (the API-era version of "require the requested job's title link").
+- Routing rules (user, 2026-10-24; prompt.txt): AI-training gigs follow the
+  expertise they require (only no-profession annotation -> content/ai_data_annotation);
+  selling titles -> Sales and call-center/customer-service titles -> Customer Service
+  whatever the duties lean to; office cashier -> Finance/treasury, point-of-sale ->
+  Retail; drivers/couriers -> Logistics; junk, unrelated-description and "Owner"
+  self-listing posts -> other (they had filled General Management). Short/empty/
+  boilerplate descriptions are NOT junk. Results in docs/classifier-validation.md.
 - User direction 2026-10-04: after staging tests, clean/push and enable production
   classification AND channel delivery. There are 25 named families plus `other`.
   Route only by job_family; employer_sector is analytics-only. All 26 channel
@@ -593,6 +629,20 @@ port and logins disabled — never the production profile directly.
   `production-0b8347a-20261024-1033`, rollback `rollback-20261024-1033` = c7a706b):
   atomic budget file (F3), reservation release rule (F1), Indeed Turnstile
   post-click cap, Mindrift blocked. See docs/DEPLOYMENT.md.
+- 2026-10-24 15:05 Cairo: main `4b43f80` deployed (image
+  `production-4b43f80-20261024-1503`, rollback `rollback-20261024-1503` = 0b8347a):
+  monitor scrape_result confirm rule, classifier routing rules (prompt
+  `471001db34d1b320`, live from 14:57: see the rollback note in Deploy gate).
+  First attempt rolled back on a pre-existing LinkedIn window_complete gap.
+- 2026-10-24 15:35 Cairo: main `65113da` deployed (image
+  `production-65113da-20261024-1533`, rollback `rollback-20261024-1533` = 4b43f80):
+  LinkedIn window diagnostics (`served`/`repeated` per window).
+- 2026-10-24 15:50: images older than c7a706b deleted (oldest rollback target now
+  `rollback-20261024-1033` = c7a706b); see docs/DEPLOYMENT.md.
+- 2026-10-24 16:44 Cairo: main `a89c078` deployed (image
+  `production-a89c078-20261024-1639`, rollback `rollback-20261024-1639` = 65113da):
+  LinkedIn count-ahead (no alert for <= 3 short, relevance probe), NaukriGulf
+  ERR_NETWORK_CHANGED retry, dead-code cleanup, ruff in deploy.sh.
 
 ## Immediate queue notifications
 - After committing a complete scrape cycle, notify `enrichment`; after committing

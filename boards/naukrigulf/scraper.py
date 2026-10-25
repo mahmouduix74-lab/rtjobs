@@ -34,6 +34,12 @@ logger = logging.getLogger(__name__)
 # The app requests the list right after its bootstrap XHRs; on a slow link
 # that can take a while, but past this the run reports what it saw.
 _API_WAIT_SECONDS = 30
+# A navigation aborted by a change in THIS machine's network gets one more
+# visit: every container switch (deploy, rollback) and some host network
+# changes abort the first navigation, ~1 s after Chrome starts (NAUKRIGULF.md).
+# Any other failure keeps the one-visit rule (session `retries=1`).
+_LOCAL_NETWORK_ERRORS = ("net::ERR_NETWORK_CHANGED",)
+_LOCAL_RETRY_DELAY_SECONDS = 3
 
 
 def _strip_html(html_text: str) -> str:
@@ -139,6 +145,7 @@ class NaukriGulfJobSpider(Spider):
         self._api_status: int | None = None
         self._api_failure: str = ""
         self._api_reads: list = []
+        self.navigation_error = ""  # why the search page did not load, if it did not
         super().__init__(*args, **kwargs)
         from core.log import configure_spider_logging
         configure_spider_logging(self)
@@ -219,6 +226,10 @@ class NaukriGulfJobSpider(Spider):
             return f"The app shows its error screen ({self.sel['search']['error_text']!r})."
         return f"The search API response never arrived within {_API_WAIT_SECONDS}s."
 
+    async def on_error(self, request: Request, error: Exception):
+        # Called after scrapling gave up on the navigation (one attempt).
+        self.navigation_error = str(error).splitlines()[0][:300] if str(error) else type(error).__name__
+
     async def start_requests(self):
         yield Request(
             NAUKRIGULF_SEARCH_URL,
@@ -266,10 +277,19 @@ class NaukriGulfJobSpider(Spider):
 
 def scrape(selectors: dict, cdp_url: str, health: ScrapeHealth | None = None) -> dict:
     """Run the spider. Returns {'items': [...], 'listings': {known id: posted_at}}."""
-    spider = NaukriGulfJobSpider(selectors=selectors, cdp_url=cdp_url)
-    if health is not None:
+    health = health if health is not None else ScrapeHealth("naukrigulf")
+    for attempt in range(2):
+        spider = NaukriGulfJobSpider(selectors=selectors, cdp_url=cdp_url)
         spider.health = health
-    result = spider.start()
+        result = spider.start()
+        local = any(code in spider.navigation_error for code in _LOCAL_NETWORK_ERRORS)
+        if attempt or "search_fetch" in health.checks or not local:
+            break
+        logger.info("[naukrigulf] Search navigation hit a local network change (%s); one more visit in %ss.",
+                    spider.navigation_error, _LOCAL_RETRY_DELAY_SECONDS)
+        time.sleep(_LOCAL_RETRY_DELAY_SECONDS)
+    if spider.navigation_error and "search_fetch" not in health.checks:
+        health.check("search_fetch", False, f"Search navigation failed: {spider.navigation_error}")
     items = list(result.items)
     spider.health.report()
     logger.info(f"[naukrigulf] {len(items)} item(s) scraped in {result.stats.elapsed_seconds:.1f}s")

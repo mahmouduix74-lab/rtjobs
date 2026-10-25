@@ -508,7 +508,7 @@ def verify(directory):
     with ExitStack() as stack:
         stack.enter_context(patch.object(li_board.login_state, "is_blocked", return_value=False))
         stack.enter_context(patch.object(li_board.login_state, "should_wipe_profile", return_value=False))
-        for module, cls in ((li_board, li_board.LinkedInBoard), (wu_board, wu_board.WuzzufBoard), (in_board, in_board.IndeedBoard)):
+        for _module, cls in ((li_board, li_board.LinkedInBoard), (wu_board, wu_board.WuzzufBoard), (in_board, in_board.IndeedBoard)):
             with patch.object(board_base, "chrome_session", side_effect=RuntimeError("startup failed")):
                 try:
                     cls().run()
@@ -613,10 +613,11 @@ def verify(directory):
         stack.enter_context(patch.object(li_board.login_state, "should_wipe_profile", return_value=False))
         for module, cls in ((li_board, li_board.LinkedInBoard), (wu_board, wu_board.WuzzufBoard), (in_board, in_board.IndeedBoard)):
             for healthy in (False, True):
+                # Called within this iteration, so the loop variables are current.
                 def fake_scrape(selectors, cdp_url, health, on_job=None):
                     health.check("search_fetch", True)
-                    health.check("search_structure", healthy, "Simulated incomplete page")
-                    items = [dict(base, source=cls.name, external_id="status-test-" + str(healthy))]
+                    health.check("search_structure", healthy, "Simulated incomplete page")  # noqa: B023
+                    items = [dict(base, source=cls.name, external_id="status-test-" + str(healthy))]  # noqa: B023
                     return {"items": items, "listings": {}, "login_redirect": False, "logged_out": False, "blocked": False}
                 with ExitStack() as case:
                     case.enter_context(patch.object(board_base, "chrome_session", side_effect=lambda *a, **kw: nullcontext("unused")))
@@ -742,7 +743,6 @@ def verify_reposts():
 
 def verify_browser_launch():
     """CDP origin allow-list, sandbox switch, busy port, group stop, crash stderr."""
-    import signal as signals
     import socket
     import tempfile as tmp
     from core import browser
@@ -1025,7 +1025,7 @@ def verify_person_wait():
                 first = len(_calls) == 1
                 return SimpleNamespace(status="ok", error=""), {
                     "items": [], "listings": {}, "blocked": False, "login_redirect": False,
-                    "logged_out": False, "needs_login": False, "signed_in": not first, flag: first}
+                    "logged_out": False, "needs_login": False, "signed_in": not first, flag: first}  # noqa: B023 (same iteration)
             def login_check(cdp, _waits=waits):
                 if _waits:
                     with board_budget.paused():
@@ -1530,6 +1530,31 @@ def verify_naukrigulf():
     with patch.object(telegram, "notify_failure", return_value=True) as alert:
         blocked.health.report(); blocked.health.report()
         assert alert.call_count == 1 and "naukrigulf" in alert.call_args.args[0].lower()
+    # A navigation aborted by a local network change (every container switch)
+    # gets one more visit; any other failure keeps the one-visit rule.
+    def runs(*kinds):
+        queue, starts = list(kinds), []
+        def start(self):
+            kind = queue.pop(0); starts.append(kind)
+            if kind == "ok":
+                self.health.check("search_fetch", True)
+            else:
+                self.navigation_error = f"Page.goto: net::{kind} at https://www.naukrigulf.com/jobs-in-egypt"
+            return SimpleNamespace(items=[{"external_id": "1"}] if kind == "ok" else [],
+                                   stats=SimpleNamespace(elapsed_seconds=0.1))
+        health = ng.ScrapeHealth("naukrigulf")
+        with patch.object(ng.NaukriGulfJobSpider, "start", autospec=True, side_effect=start), \
+             patch.object(ng.time, "sleep") as pause, patch.object(ng.ScrapeHealth, "report"):
+            out = ng.scrape(sel, "http://127.0.0.1:1", health)
+        return out, health, starts, pause.call_count
+    out, health, starts, pauses = runs("ERR_NETWORK_CHANGED", "ok")
+    assert starts == ["ERR_NETWORK_CHANGED", "ok"] and pauses == 1 and len(out["items"]) == 1 and health.status == "ok"
+    out, health, starts, _ = runs("ERR_NETWORK_CHANGED", "ERR_NETWORK_CHANGED")
+    assert len(starts) == 2 and not out["items"] and "Search navigation failed: Page.goto: net::ERR_NETWORK_CHANGED" \
+        in health.error, health.error
+    out, health, starts, pauses = runs("ERR_NAME_NOT_RESOLVED")
+    assert starts == ["ERR_NAME_NOT_RESOLVED"] and not pauses and "ERR_NAME_NOT_RESOLVED" in health.error
+    assert runs("ok")[2] == ["ok"]
     # Board wiring: registered, own CDP port, selectors present.
     assert NaukriGulfBoard in entry.BOARDS and NaukriGulfBoard.port_offset == 3
     offsets = [cls.port_offset for cls in entry.BOARDS]
@@ -1702,7 +1727,6 @@ def verify_direct_search():
 
 
 def verify_browser_recovery():
-    from datetime import datetime
     from boards.linkedin import scraper as li
     from boards.indeed import scraper as indeed
     from boards.base import load_board_selectors
@@ -1796,6 +1820,34 @@ def verify_browser_recovery():
         assert not spider.health.checks["window_filter"]["good"] and spider.health.checks["window_complete"]["good"]
         spider, _ = await run(LinkedInApiPage([(200, cards_body(ids[:25], total=40)), (200, cards_body([], total=40))]), known=ids)
         assert not spider.health.checks["window_complete"]["good"] and "25 of the 40" in spider.health.error
+        # The gap says which kind it is (2026-10-24: total ran 1-2 ahead for 2 h):
+        # a job served on two pages hides another, or LinkedIn counts one it never serves.
+        page = LinkedInApiPage([(200, cards_body(ids[:25], total=30)), (200, cards_body(ids[24:29], total=30)),
+                                (200, cards_body([], total=30))])
+        spider, _ = await run(page, known=ids)
+        assert not spider.health.checks["window_complete"]["good"] and len(page.calls) == 3
+        assert "29 of the 30" in spider.health.error and "pages served 25+5+0 cards, 1 repeated from an earlier page" \
+            f" ({ids[24]})" in spider.health.error, spider.health.error
+        # No repeats, list ended, up to 3 short: LinkedIn counts jobs it does not
+        # list yet. One relevance-order page looks for them; never an alert.
+        short = [(200, cards_body(ids[:25], total=30)), (200, cards_body(ids[25:29], total=30)), (200, cards_body([], total=30))]
+        page = LinkedInApiPage(short + [(200, cards_body(ids[:25], total=30))])
+        spider, saved = await run(page, known=ids)
+        assert spider.health.status == "ok" and spider.health.checks["window_complete"]["good"], spider.health.error
+        assert len(page.calls) == 4 and "sortBy:List(DD)" in page.calls[0] and "sortBy:List(R)" in page.calls[3] \
+            and "start=0" in page.calls[3] and not saved
+        page = LinkedInApiPage(short + [(200, cards_body([ids[29]] + ids[:10], total=30))], {ids[29]: (200, posting(ids[29]))})
+        spider, saved = await run(page, known=ids[:29])
+        assert spider.health.status == "ok" and [job["external_id"] for job in saved] == [ids[29]], spider.health.error
+        page = LinkedInApiPage(short + [(429, "")])
+        spider, saved = await run(page, known=ids)
+        assert spider.health.status == "ok" and len(page.calls) == 4 and not saved, spider.health.error
+        # One past the limit, or a repeat (above), is ours to explain: no probe, alert.
+        page = LinkedInApiPage([(200, cards_body(ids[:25], total=30)), (200, cards_body(ids[25:26], total=30)),
+                                (200, cards_body([], total=30))])
+        spider, _ = await run(page, known=ids)
+        assert not spider.health.checks["window_complete"]["good"] and len(page.calls) == 3
+        assert "26 of the 30" in spider.health.error and "pages served 25+1+0 cards, 0 repeated" in spider.health.error
         odd = cards_body(ids[:2])
         odd["data"]["elements"].append({"jobCardUnion": {"*jobPostingCard": "urn:li:fsd_promotedCard:1"}})
         spider, _ = await run(LinkedInApiPage([(200, odd)]), known=ids)

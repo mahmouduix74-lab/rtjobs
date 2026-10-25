@@ -46,6 +46,9 @@ base=$(sed -n 's/^ARG CHROME_BASE=//p' Dockerfile)
 [ -n "$base" ] || die "Dockerfile has no ARG CHROME_BASE"
 docker image inspect "$base" >/dev/null 2>&1 \
     || die "Chrome base image $base is missing: run scripts/build_chrome_base.sh"
+# Lint for bugs (ruff.toml) before anything is built; dev tool, not in the image.
+[ -x .venv/bin/ruff ] || die "ruff is missing: .venv/bin/pip install -r requirements-dev.txt"
+.venv/bin/ruff check --quiet . || die "ruff found the problems above: fix them (or adjust ruff.toml)"
 
 # --- 2. Build ---------------------------------------------------------------
 log "Building $candidate from $branch@$sha"

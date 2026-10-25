@@ -22,8 +22,11 @@ detection, core/db.record_listings): no extra requests.
 Guardrails (the API is private and can change without notice): LinkedIn
 answers HTTP 200 even for a retired decoration, so a status code proves
 nothing. Every response is checked for the fields we use (`search_structure`,
-`detail_content`), the window must be complete (`window_complete`), still
-time-filtered (`window_filter`) and carry listing times (`listing_times`),
+`detail_content`), the window must be complete (`window_complete`; a list
+that ended with no repeats up to 3 jobs short of LinkedIn's count is LinkedIn
+counting jobs it does not list yet: one relevance-order page looks for them,
+no alert), still time-filtered (`window_filter`) and carry listing times
+(`listing_times`),
 and a posting record must be the job we asked for. Request templates live in
 markup/linkedin/selectors.json ("api"): bind-mounted, so a new decoration
 version is a file edit, not a rebuild. A posting record that keeps failing is
@@ -65,6 +68,13 @@ _CARD_URN = re.compile(r"^urn:li:fsd_jobPostingCard:\((\d+),")
 _GIVE_UP_DETAIL_MINUTES = 45
 # Cards listed longer ago than this mean the time filter no longer applies.
 _WINDOW_MAX_AGE_HOURS = 3
+# LinkedIn's paging.total can run ahead of its list by a job or two: a new job
+# is counted minutes before its card is served (2026-10-24 16:21 38 of 39, 16:24
+# 43 of 43), and one job counted 13:03-15:00 was never served. A gap up to this
+# size, after the list ended with no repeats, is LinkedIn's count, not a fault:
+# one page in another order looks for the missing jobs, and nothing alerts.
+_COUNT_AHEAD_MAX = 3
+_PROBE_SORT = ("sortBy:List(DD)", "sortBy:List(R)")  # date order -> relevance order
 _API_TIMEOUT_MS = 15_000
 
 # In-page fetch: the request goes out from LinkedIn's own page with the
@@ -390,12 +400,18 @@ class LinkedInJobSpider(Spider):
         Pages until the IDs collected reach the first page's total. A job
         added while paging shifts later pages by one (a repeat, not a gap); a
         job removed meanwhile can hide one other job until the next run.
+        `served` (cards per page) and `repeated` (IDs an earlier page already
+        had) tell those apart from a job LinkedIn counts but never lists.
         """
         ids: list[str] = []
         cards: dict[str, dict] = {}
-        total, unidentified, calls = None, 0, 0
+        served: list[int] = []
+        repeated: list[str] = []
+        total, unidentified, calls, probe = None, 0, 0, None
         size = int(self.api.get("page_size", 25))
-        with timing.stage("linkedin", "job_list", lambda: {"calls": calls, "total": total, "ids": len(ids)}):
+        with timing.stage("linkedin", "job_list", lambda: {"calls": calls, "total": total, "ids": len(ids),
+                                                            "served": served, "repeated": len(repeated),
+                                                            "probe": probe}):
             for start in range(0, size * LINKEDIN_MAX_WINDOW_PAGES, size):
                 if calls:
                     await self._pause(0.3, 0.8)
@@ -421,21 +437,63 @@ class LinkedInJobSpider(Spider):
                 total = parsed["total"] if total is None else total
                 unidentified += parsed["unidentified"]
                 fresh = [key for key in parsed["ids"] if key not in cards]
+                served.append(len(parsed["ids"]))
+                repeated += [key for key in parsed["ids"] if key in cards]
                 for key in parsed["ids"]:
                     cards.setdefault(key, {}).update(parsed["cards"].get(key, {}))
                 ids += fresh
                 if not parsed["ids"] or len(ids) >= total:
                     break
+            if self._counted_ahead(total, ids, served, repeated):
+                await self._pause(0.3, 0.8)
+                probe = await self._probe(page, ids, cards)
+                calls += 1
         self.health.check("search_structure", True)
-        self._check_window(ids, cards, total, unidentified, calls)
+        self._check_window(ids, cards, total, unidentified, calls, served, repeated, probe)
         return ids, cards
 
-    def _check_window(self, ids: list[str], cards: dict, total: int, unidentified: int, calls: int):
+    def _counted_ahead(self, total: int, ids: list[str], served: list[int], repeated: list[str]) -> bool:
+        """The list ended (a short page) with no repeats, a few jobs short of
+        LinkedIn's count: LinkedIn counts jobs it does not (yet) list."""
+        return (0 < total - len(ids) <= _COUNT_AHEAD_MAX and not repeated
+                and served[-1] < int(self.api.get("page_size", 25)))
+
+    async def _probe(self, page, ids: list[str], cards: dict) -> dict:
+        """One job-list page in relevance order, for jobs the date-ordered
+        pages did not serve; found ones join ids/cards and are read as usual.
+        A failed probe changes nothing: it never alerts or retries."""
+        url = self._cards_url(0)
+        if _PROBE_SORT[0] not in url:
+            return {"error": "api.cards_url has no " + _PROBE_SORT[0]}
+        status, body, problem = await self._api(page, url.replace(*_PROBE_SORT))
+        if body is None:
+            return {"error": problem or f"HTTP {status}"}
+        try:
+            parsed = _parse_cards(body)
+        except ApiShapeError as exc:
+            return {"error": str(exc)[:80]}
+        found = list(dict.fromkeys(key for key in parsed["ids"] if key not in cards))
+        for key in found:
+            cards[key] = parsed["cards"].get(key, {})
+        ids += found
+        if found:
+            logger.info("[linkedin] Relevance order served %s job(s) the date order did not: %s",
+                        len(found), ", ".join(found))
+        return {"served": len(parsed["ids"]), "found": found}
+
+    def _check_window(self, ids: list[str], cards: dict, total: int, unidentified: int, calls: int,
+                      served: list[int], repeated: list[str], probe: dict | None = None):
         """Guardrails on a listed window: complete, time-filtered, with times."""
         cap = int(self.api.get("page_size", 25)) * LINKEDIN_MAX_WINDOW_PAGES
-        self.health.check("window_complete", len(ids) >= total,
+        pages = f"pages served {'+'.join(map(str, served))} cards, {len(repeated)} repeated from an earlier page"
+        ahead = self._counted_ahead(total, ids, served, repeated)
+        if ahead:
+            logger.info("[linkedin] LinkedIn counts %s job(s) more than it lists (%s; relevance probe: %s): "
+                        "not a fault, they are read once listed.", total - len(ids), pages, probe)
+        self.health.check("window_complete", len(ids) >= total or ahead,
                           f"Collected {len(ids)} of the {total} jobs LinkedIn reported for the recent window in "
                           f"{calls} request(s)" + (f" (cap: {cap}; raise LINKEDIN_MAX_WINDOW_PAGES)" if total > cap else "")
+                          + f"; {pages}" + (f" ({', '.join(repeated[:5])})" if repeated else "")
                           + ". The rest are read on later runs while they stay listed.")
         self.health.check("card_ids", not unidentified,
                           f"{unidentified} job-list entries had no job ID and were skipped (API change?).")

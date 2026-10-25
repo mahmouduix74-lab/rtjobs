@@ -220,6 +220,11 @@ API calls retry a network error or 5xx once; HTTP 401 (signed out) goes to the
 login check, 403/429 stop further calls for the run. LinkedIn checks:
 `search_structure` (the job list's shape), `window_complete`, `window_filter`,
 `listing_times`, `card_ids`, `detail_fetch`, `detail_content` and the job fields.
+An incomplete window (`window_complete`) reports the cards each page served and
+the IDs repeated from an earlier page, telling shifting pages from a job
+LinkedIn counts but does not list. A list that ended up to 3 short with no
+repeats is the latter (LinkedIn counts new jobs minutes before listing them): one
+page in relevance order looks for the missing jobs, and it does not alert.
 Alerts retain transport codes and HTTP errors without request URLs, query
 strings, cookies or bodies. These checks cannot always identify whether the
 local network or the remote server caused a connection failure.
@@ -397,9 +402,11 @@ Worker logs expose `result_cache`, input/cached/write token counts and cost;
 Run `.venv/bin/python scripts/verify_offline.py` for fixture-based parsing,
 SQLite migration, caching, routing, retries and browser-patch checks. It uses
 temporary databases, dummy credentials and blocks HTTP requests; `scripts/deploy.sh`
-runs it inside every candidate image before a deploy. Analytics-only
-packages are in `requirements-analysis.txt`; the scraper image installs only
-`requirements.txt`.
+runs it inside every candidate image before a deploy. `.venv/bin/ruff check .`
+lints for bugs (`ruff.toml`: pyflakes + bugbear, not style); `deploy.sh` runs it
+before building and stops on any finding. Analytics-only packages are in
+`requirements-analysis.txt` and dev tools (ruff) in `requirements-dev.txt`; the
+scraper image installs only `requirements.txt`.
 
 The 2026-10-04 runtime update pins Scrapling 0.4.15 and Playwright/Patchright
 1.63.0. Browser checks verified tab reuse, idempotent setup and persistent CDP

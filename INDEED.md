@@ -16,10 +16,12 @@ https://eg.indeed.com/jobs?q=&l=مصر&radius=100&sort=date&vjk=992741b34fe51afd
 - Plain curl with CF cookies → 403 "Security Check" (Cloudflare captcha).
 - Must use scrapling stealth session with `solve_cloudflare=True`, persistent
   profile (cf_clearance), CDP pattern like the other boards.
-- Turnstile solves used to take exactly ~2 min (321 of 361, Oct 14-24): the
+- Turnstile solves used to take exactly ~2 min (321 of 361, Oct 9-22): the
   solver's post-click networkidle wait had no timeout, so it ran to the 120s
-  page default. Capped at 10s since 2026-10-24 (`core.browser._SolverView`,
-  AGENTS.md "Cycle latency work"). A solve still >60s = look at the solver.
+  page default. The last one was Oct 22 14:57 Cairo; since then Indeed's page
+  goes idle and solves take 3-8s even without the fix. Capped at 10s since
+  2026-10-24 (`core.browser._SolverView`, AGENTS.md "Cycle latency work") in
+  case the never-idle page returns. A solve still >60s = look at the solver.
 - Since ~Oct 2026 Indeed is LOGIN-GATED for anonymous sessions: even after a
   solved turnstile it 403-redirects to
   `/account/login?branding=login-required&from=bot-detection-anonymous`.

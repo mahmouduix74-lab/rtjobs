@@ -100,6 +100,9 @@ The independent `monitor` service checks every minute. Defaults: worker heartbea
 and queue age 15 minutes; source scrape freshness 30 minutes; alert on three
 classification/delivery failures. Authentication failures and budget pauses alert
 immediately. Source parser alerts retain their existing snapshots and diagnosis.
+A board's latest scrape result alerts with the same confirm rule as the parser
+checks: the last two completed runs not ok, or three within an hour; one bad run
+that the next run heals stays silent.
 
 Successful alerts are deduplicated per failure episode in SQLite. A failed alert
 send retries after five minutes. Recovery resets the episode. Missing salaries

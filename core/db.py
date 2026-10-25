@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 from config import (DB_PATH, ENRICHMENT_ENABLED, ENRICHMENT_SCHEMA_VERSION,
-                    NOTIFY_BATCH_SIZE, NOTIFY_PER_CHANNEL_LIMIT, CLASSIFIER_RETRY_MAX_SECONDS,
+                    NOTIFY_BATCH_SIZE, NOTIFY_PER_CHANNEL_LIMIT,
                     REPOST_MIN_GAP_HOURS, REPOST_REDELIVER_AFTER_DAYS)
 from core import clock, wakeup
 
@@ -268,11 +268,6 @@ def init_db():
 # ---------------------------------------------------------------------------
 
 
-def save_job(job: dict):
-    """Compatibility wrapper for a single insert."""
-    return save_jobs([job])
-
-
 def save_jobs(jobs: list[dict], blocked: list[tuple[str, str]] | None = None,
               enqueue: bool | None = None) -> int:
     """Save raw jobs, dedupe IDs and queue entries in one atomic transaction.
@@ -316,14 +311,6 @@ def save_jobs(jobs: list[dict], blocked: list[tuple[str, str]] | None = None,
         ids.extend(blocked or [])
         conn.executemany("INSERT OR IGNORE INTO seen_ids (source, external_id) VALUES (?, ?)", ids)
     return inserted
-
-
-def load_seen_ids(source: str) -> set[str]:
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT external_id FROM seen_ids WHERE source = ?", (source,)
-        )
-        return {r["external_id"] for r in rows}
 
 
 def seen_ids_for(source: str, external_ids) -> set[str]:
@@ -408,17 +395,6 @@ def record_listings(source: str, listings: dict[str, str]) -> dict:
     if report["requeued"]:
         wakeup.notify("delivery")
     return report
-
-
-def mark_seen(source: str, external_id: str):
-    """Record an id as seen WITHOUT saving a job — used for jobs we
-    deliberately drop (e.g. blocked companies) so they're never
-    re-scraped, but also never stored or notified."""
-    with get_db() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO seen_ids (source, external_id) VALUES (?, ?)",
-            (source, str(external_id)),
-        )
 
 
 def get_unnotified(source: str | None = None, limit: int = NOTIFY_BATCH_SIZE) -> list[sqlite3.Row]:
@@ -606,14 +582,6 @@ def quarantine_enrichments(entries: list[tuple[int, str]]):
         conn.executemany("UPDATE job_enrichments SET state='input_error',error=?,updated_at=? "
                          "WHERE job_id=? AND state='pending'",
                          [(error, now_str(), job_id) for job_id, error in entries])
-
-
-def retry_enrichment(job_id: int, attempts: int, error: str, retry_at: str | None = None):
-    retry_at = retry_at or clock.after(min(CLASSIFIER_RETRY_MAX_SECONDS, 60 * 2 ** min(attempts, 10)))
-    with get_db() as conn:
-        conn.execute("UPDATE job_enrichments SET attempts=?, next_attempt_at=?, error=?, updated_at=? WHERE job_id=?",
-                     (attempts, retry_at, error, now_str(), job_id))
-    return retry_at
 
 
 def set_pipeline_state(name: str, value: dict):

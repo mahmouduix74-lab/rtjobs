@@ -1,0 +1,14 @@
+# Lint for bugs, not style: `.venv/bin/ruff check .` (dev only, not in the image).
+# Ruff honors .gitignore, so runtime data (profiles, snapshots, exports) is skipped.
+target-version = "py313"  # the production image's Python (docker/chrome-base.Dockerfile)
+
+[lint]
+# E4/E7/E9: import, statement and syntax errors; F: pyflakes (undefined names,
+# unused imports/variables, f-string mistakes); B: bugbear (likely bugs such as
+# loop variables captured late or mutable defaults); PLE: pylint errors.
+select = ["E4", "E7", "E9", "F", "B", "PLE"]
+ignore = [
+    "B905",  # zip() without strict=: the lengths here are equal by construction
+    "E701", "E702", "E731",  # compact one-liners (the verify scripts): style, not bugs
+    "E401",  # several imports on one line: style
+]
