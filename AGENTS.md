@@ -654,6 +654,12 @@ port and logins disabled — never the production profile directly.
   `production-a89c078-20261024-1639`, rollback `rollback-20261024-1639` = 65113da):
   LinkedIn count-ahead (no alert for <= 3 short, relevance probe), NaukriGulf
   ERR_NETWORK_CHANGED retry, dead-code cleanup, ruff in deploy.sh.
+- 2026-10-26 18:39 Cairo: main `afc7341` deployed (image
+  `production-afc7341-20261026-1837`, rollback `rollback-20261026-1837` = a89c078;
+  the USER ran deploy.sh: auto mode blocks Claude from production deploys):
+  LinkedIn count-ahead limit 5, monitor no longer repeats a board's alert
+  (reminders kept), `[alert] Sent:` log lines, Indeed bot-check prompt wording +
+  next-attempt time, no ForceReply attempt in channels.
 
 ## Immediate queue notifications
 - After committing a complete scrape cycle, notify `enrichment`; after committing

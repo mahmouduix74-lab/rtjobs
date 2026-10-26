@@ -409,3 +409,24 @@ profiles, Sep 4), `artifacts/` (Oct 4 pre-deploy DB copy + staging),
 ok, Chrome 151.0.7922.108; switched 16:44:32; verified all four boards ok/ok.
 Image `rtjobs-scraper:production-a89c078-20261024-1639`; rollback target
 `rtjobs-scraper:rollback-20261024-1639` (= 65113da). Schema unchanged.
+
+## 2026-10-26 18:39 Cairo: quieter, clearer alerts (`afc7341`)
+
+`reliability/alert-noise` (`b54486d`), after the Oct 25-26 alert review:
+- LinkedIn count-ahead limit 3 -> 5. 930 windows Oct 24-26 were short by 1-4,
+  never 5+; the 12 that were 4 short all alerted (Oct 26 13:09-16:12: about 5
+  board + 5 monitor messages) and each healed on the next run.
+- The monitor's `scrape_result_<board>` no longer repeats an alert the board
+  already sent for a check that failed in its latest run; the 3-hourly
+  reminders still follow.
+- Every `notify_failure` logs `[alert] Sent: <subject>` or `NOT delivered`.
+- Indeed: the code prompt names the `from=` reason ("sign-in needed (bot
+  check)" for bot-detection-anonymous: on Oct 26 01:24 such an episode cleared
+  without a code after the host's WiFi reconnected); missed/rejected-code
+  alerts name the next attempt time; ForceReply is skipped in channels.
+
+The user ran `scripts/deploy.sh` (18:37:19-18:42:29; auto mode blocks Claude
+from production deploys): gate 46 checks, scrapling contract ok, Chrome
+151.0.7922.108; switched 18:39:19; verified all four boards ok/ok. Image
+`rtjobs-scraper:production-afc7341-20261026-1837`; rollback target
+`rtjobs-scraper:rollback-20261026-1837` (= a89c078). Schema unchanged.
