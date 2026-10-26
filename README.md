@@ -222,7 +222,7 @@ login check, 403/429 stop further calls for the run. LinkedIn checks:
 `listing_times`, `card_ids`, `detail_fetch`, `detail_content` and the job fields.
 An incomplete window (`window_complete`) reports the cards each page served and
 the IDs repeated from an earlier page, telling shifting pages from a job
-LinkedIn counts but does not list. A list that ended up to 3 short with no
+LinkedIn counts but does not list. A list that ended up to 5 short with no
 repeats is the latter (LinkedIn counts new jobs minutes before listing them): one
 page in relevance order looks for the missing jobs, and it does not alert.
 Alerts retain transport codes and HTTP errors without request URLs, query
@@ -232,9 +232,12 @@ local network or the remote server caused a connection failure.
 The separate pipeline monitor alerts board-level problems (no recent run, the
 latest run not ok, workers down, queues stuck) once per episode and then
 **every 3 hours while it lasts** (`PIPELINE_ALERT_REMIND_SECONDS`): on Oct 21-23
-LinkedIn was down 2.5 days after a single alert. It also alerts when LinkedIn's
+LinkedIn was down 2.5 days after a single alert. A failing run the board has
+already alerted about is not announced a second time by the monitor (only its
+reminders follow). It also alerts when LinkedIn's
 runs succeed but save no new job for 6 hours (`board_quiet_linkedin`; the longest
-normal gap was 3.2 h), which no parser check can see.
+normal gap was 3.2 h), which no parser check can see. Every alert writes one
+`[alert] Sent: <subject>` (or `NOT delivered`) line to its process log.
 
 ## 7. When the site changes (markup resilience)
 

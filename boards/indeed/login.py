@@ -7,17 +7,20 @@ signs in with an emailed 6-digit code ("Sign in with a code instead" — no
 password, no Google session in automation).
 
 Telegram-assisted: when logged out, the run emails itself a fresh code by
-driving the form, alerts the failure channel with a ForceReply prompt, and
-holds the browser open up to INDEED_CODE_WAIT_SECONDS for the user to DM
-the code to the bot (a reply to the prompt is matched first, any 6-digit
-message is accepted as fallback). Login is one-time — the session persists
-in the profile volume; re-login only happens on expiry, with a cooldown so
-a missed code doesn't spam Gmail with a fresh code every 6 minutes.
+driving the form, alerts the failure channel with a prompt (ForceReply where
+the chat allows it), and holds the browser open up to INDEED_CODE_WAIT_SECONDS
+for the user to DM the code to the bot (a reply to the prompt is matched
+first, any 6-digit message is accepted as fallback). Login is one-time — the
+session persists in the profile volume; re-login only happens on expiry, with
+a cooldown so a missed code doesn't spam Gmail with a fresh code every 6
+minutes. The prompt names Indeed's `from=` reason: a bot check
+(bot-detection-anonymous) is not necessarily an expired session.
 """
 
 import logging
 import re
 import time
+from urllib.parse import parse_qs, urlsplit
 
 from config import (
     INDEED_CODE_WAIT_SECONDS,
@@ -40,6 +43,10 @@ _LOGGED_IN_MARKERS = ('"isLoggedIn":true', "account/logout")
 # checked on auth pages, never on job content, so no false positives.
 _CF_MARKERS = ("Just a moment", "Security Check", "Access Denied",
                "INDEED_CLOUDFLARE_STATIC_PAGE", "cf-chl")
+# Indeed's reason (`from=`) on the sign-in redirect. Every logout logged since
+# 2026-10-10 carried this one, and 2026-10-26 one cleared WITHOUT a code right
+# after the host's network reconnected: the saved session may still be valid.
+_BOT_CHECK = "bot-detection-anonymous"
 
 # Episode state (login_state table, indeed-scoped so LinkedIn's keys are
 # untouched). A missed/failed code sets a cooldown; the post-cooldown run
@@ -57,6 +64,14 @@ _CODE_COOLDOWN = 30 * 60  # s — quiet period after a missed/rejected code
 
 def is_logged_out_url(url: str) -> bool:
     return bool(_LOGGED_OUT.search(url or ""))
+
+
+def redirect_reason(url: str) -> str:
+    """The `from=` reason on Indeed's sign-in redirect ('' when absent)."""
+    try:
+        return (parse_qs(urlsplit(url or "").query).get("from") or [""])[0]
+    except ValueError:
+        return ""
 
 
 def is_jsessionid_bounce(url: str) -> bool:
@@ -144,6 +159,12 @@ def _set_cooldown() -> None:
     db.set_state(AWAITING_KEY, "0")
 
 
+def _next_attempt() -> str:
+    """Local HH:MM a cooldown starting now ends: the first run after it emails
+    a fresh code and prompts again (a code sent in between is ignored)."""
+    return time.strftime("%H:%M", time.localtime(time.time() + _CODE_COOLDOWN))
+
+
 def clear_episode_flags() -> None:
     """Successful run — clear logout/block episode state."""
     for key in (AWAITING_KEY, WINDOW_KEY, ALERT_MSG_KEY, ALERTED_KEY,
@@ -176,8 +197,10 @@ def mark_logged_out() -> None:
     )
 
 
-def _alert_for_code() -> tuple[int, int | None]:
-    """Open the code window and prompt the user. Returns (window, msg_id)."""
+def _alert_for_code(reason: str = "") -> tuple[int, int | None]:
+    """Open the code window and prompt the user. Returns (window, msg_id).
+    `reason` is the redirect's `from=` value: a bot check says so instead of
+    claiming the session expired."""
     window = telegram.latest_update_id()
     db.set_state(WINDOW_KEY, window)
     db.set_state(AWAITING_KEY, "1")
@@ -186,12 +209,22 @@ def _alert_for_code() -> tuple[int, int | None]:
     username = telegram.get_bot_username()
     dm = f"@{username}" if username else "the bot"
     wait_min = max(1, _CODE_WAIT // 60)
+    if reason == _BOT_CHECK:
+        head = ("Indeed sign-in needed (bot check)\n\n"
+                f"Indeed's bot check sent the search page to sign-in (from={reason});"
+                " the saved session may still be valid.\n\n")
+        note = ("\n\nIt has cleared without a code before, right after the"
+                " internet connection dropped and reconnected.")
+    else:
+        head = ("Indeed session expired — re-login needed"
+                + (f" (from={reason})" if reason else "") + "\n\n")
+        note = ""
     msg_id = telegram.send_login_prompt(
         TELEGRAM_FAILURE_CHAT_ID,
-        "Indeed session expired — re-login needed\n\n"
-        f"A sign-in code was emailed to {INDEED_EMAIL}. Reply HERE with"
+        head
+        + f"A sign-in code was emailed to {INDEED_EMAIL}. Reply HERE with"
         f" the 6-digit code (or DM it to {dm}) within ~{wait_min}"
-        " minutes — I'm holding the browser open.",
+        " minutes — I'm holding the browser open." + note,
     )
     db.set_state(ALERT_MSG_KEY, msg_id or 0)
     logger.info(f"[indeed-login] Code prompt sent (msg {msg_id}, window {window}).")
@@ -268,7 +301,8 @@ def _submit_code(page, sel: dict, code: str) -> bool:
         notify_failure(
             "Indeed login code rejected",
             "The code was not accepted (wrong or expired). Cooling down —"
-            " the next attempt will email a fresh code and ask again.",
+            f" the first run after {_next_attempt()} emails a fresh code and"
+            " asks again.",
             snapshot,
         )
         return False
@@ -349,7 +383,7 @@ def _land_on_signin(page, selectors: dict) -> bool:
     return False
 
 
-def _do_login(page, selectors: dict) -> bool:
+def _do_login(page, selectors: dict, reason: str = "") -> bool:
     if not INDEED_EMAIL:
         notify_failure(
             "Indeed email missing",
@@ -408,14 +442,15 @@ def _do_login(page, selectors: dict) -> bool:
         )
         return False
 
-    window, msg_id = _alert_for_code()
+    window, msg_id = _alert_for_code(reason)
     with board_budget.paused():  # waiting for a person, not the site
         code = _wait_for_code(page, sel["code_input"], window, msg_id)
     if not code:
         notify_failure(
             "Indeed login code missing",
             f"No code arrived within {_CODE_WAIT // 60} minutes. Cooling"
-            " down — the next attempt will email a fresh code and ask again.",
+            f" down — the first run after {_next_attempt()} emails a fresh code"
+            " and asks again (a code sent before then is ignored).",
         )
         _set_cooldown()
         return False
@@ -441,5 +476,6 @@ def ensure_logged_in(page, selectors: dict) -> bool:
         logger.info("[indeed-login] In code cooldown — skipping login this run.")
         return False
 
-    logger.info("[indeed-login] Logged out — starting email+code login.")
-    return _do_login(page, selectors)
+    reason = redirect_reason(url)
+    logger.info(f"[indeed-login] Logged out (from={reason or '?'}) — starting email+code login.")
+    return _do_login(page, selectors, reason)

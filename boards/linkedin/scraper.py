@@ -73,7 +73,9 @@ _WINDOW_MAX_AGE_HOURS = 3
 # 43 of 43), and one job counted 13:03-15:00 was never served. A gap up to this
 # size, after the list ended with no repeats, is LinkedIn's count, not a fault:
 # one page in another order looks for the missing jobs, and nothing alerts.
-_COUNT_AHEAD_MAX = 3
+# 5 (was 3; 2026-10-26): 930 windows Oct 24-26 were short by 1 x243, 2 x128,
+# 3 x38, 4 x12, never 5+; every 4 alerted in busy hours and healed next run.
+_COUNT_AHEAD_MAX = 5
 _PROBE_SORT = ("sortBy:List(DD)", "sortBy:List(R)")  # date order -> relevance order
 _API_TIMEOUT_MS = 15_000
 

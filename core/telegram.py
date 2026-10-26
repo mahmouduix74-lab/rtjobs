@@ -221,7 +221,14 @@ def notify_failure(subject: str, detail: str = "", snapshot: str | None = None,
     if hint:
         text += f"\n\n🔧 {escape_md(hint)}"
         plain += f"\n\n🔧 {hint}"
-    return _send(TELEGRAM_FAILURE_CHAT_ID, text, plain=plain)
+    sent = _send(TELEGRAM_FAILURE_CHAT_ID, text, plain=plain)
+    # One line per alert: "was I alerted, and when?" is answerable from the
+    # logs (2026-10-26 that took message-ID guesswork).
+    if sent:
+        logger.info("[alert] Sent: %s", subject)
+    else:
+        logger.warning("[alert] NOT delivered: %s", subject)
+    return sent
 
 
 # ---------------------------------------------------------------------------
@@ -268,22 +275,28 @@ def get_bot_username() -> str:
 
 
 def send_login_prompt(chat_id: str, text: str) -> int | None:
-    """Send plain-text with ForceReply; return the sent message_id so the
-    reply carrying the code can be matched to this prompt.
+    """Send plain text, with ForceReply where the chat allows it; return the
+    sent message_id so the reply carrying the code can be matched to this
+    prompt.
 
-    ForceReply is rejected in channels ("inline keyboard expected") — fall
-    back to a plain message there. The prompt tells the user to DM the code
-    to the bot, which works in both cases (plain 6-digit DMs are accepted
-    as fallback by poll_login_code)."""
-    data = _api(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": text,
-            "reply_markup": {"force_reply": True, "selective": True},
-        },
-        timeout=15,
-    )
+    Channels reject ForceReply ("inline keyboard expected") and the failure
+    chat is a channel, so getChat is asked first instead of logging a failed
+    send at every prompt. An unknown chat type still tries ForceReply, and a
+    rejection falls back to a plain message. The prompt tells the user to DM
+    the code to the bot, which works in both cases (plain 6-digit DMs are
+    accepted as fallback by poll_login_code)."""
+    chat = (_api("getChat", {"chat_id": chat_id}, timeout=10) or {}).get("result") or {}
+    data = None
+    if chat.get("type") != "channel":
+        data = _api(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "reply_markup": {"force_reply": True, "selective": True},
+            },
+            timeout=15,
+        )
     if data is None:
         data = _api(
             "sendMessage", {"chat_id": chat_id, "text": text}, timeout=15
