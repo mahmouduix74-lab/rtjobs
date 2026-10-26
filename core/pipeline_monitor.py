@@ -130,6 +130,17 @@ def collect_checks(now=None, started_at=None):
 _NO_REMINDER = {'classifier_budget'}
 
 
+def _board_alerted(board):
+    """True when the board's own health alert (core/scrape_health, same confirm
+    rule) went out for a check that failed in its latest completed run."""
+    with db.get_db() as conn:
+        last = conn.execute("SELECT started_at FROM runs WHERE source=? AND status!='running' ORDER BY id DESC LIMIT 1",
+                            (board,)).fetchone()
+        return bool(last and last['started_at'] and conn.execute(
+            'SELECT 1 FROM scrape_health WHERE source=? AND failing=1 AND last_alert_at IS NOT NULL AND last_seen_at>=?',
+            (board, last['started_at'])).fetchone())
+
+
 def report_checks(checks, now=None):
     """One alert per failure episode, then a "still failing" reminder every
     PIPELINE_ALERT_REMIND_SECONDS while it lasts; failed sends are retried
@@ -150,6 +161,15 @@ def report_checks(checks, now=None):
         remind = bool(failing and alerted and config.PIPELINE_ALERT_REMIND_SECONDS and name not in _NO_REMINDER
                       and (_age(alerted, now) or 0) >= config.PIPELINE_ALERT_REMIND_SECONDS)
         if not failing or (alerted and not remind) or next_at > stamp:
+            continue
+        if not remind and name.startswith('scrape_result_') and _board_alerted(name.removeprefix('scrape_result_')):
+            # The board's alert already told this story (2026-10-26: every LinkedIn
+            # episode arrived twice). It counts as this episode's alert, so the
+            # "still failing" reminders still come if the failure lasts.
+            with db.get_db() as conn:
+                conn.execute('UPDATE pipeline_alerts SET last_alert_at=?,next_alert_at=? WHERE check_name=?',
+                             (stamp, '', name))
+            logger.info('%s: the board already alerted; reminders only', name)
             continue
         subject, text = 'Pipeline: ' + name, detail
         if remind:

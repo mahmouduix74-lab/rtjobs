@@ -38,14 +38,24 @@ https://eg.indeed.com/jobs?q=&l=مصر&radius=100&sort=date&vjk=992741b34fe51afd
   (`IndeedBoard._login_check`, the same search URL + `ensure_logged_in`) runs
   only after the spider landed logged out, then the spider runs again. A
   logged-in run loads the search page once (it used to load it twice).
-- Code round-trip: the run prompts the failure channel (ForceReply, falls
-  back to plain text in channels) and long-polls Bot `getUpdates`
+- Code round-trip: the run prompts the failure channel (plain text; ForceReply
+  only where `getChat` says the chat is not a channel — channels reject it
+  with "inline keyboard expected") and long-polls Bot `getUpdates`
   (`timeout=30`, `allowed_updates=[message, channel_post]`) up to
   `INDEED_CODE_WAIT_SECONDS`. Reply in the channel or DM the bot — a reply
   to the prompt is matched first, any 6-digit message is fallback. Offset is
   persisted (`telegram_update_offset`); the window opens at alert time so
   stale codes are never consumed. A missed code cools down 30 min, then the
-  next run starts a fresh episode (fresh code + fresh prompt).
+  next run starts a fresh episode (fresh code + fresh prompt): one prompt
+  about every 42 min until a code arrives. The "code missing" alert names the
+  time of the next attempt; a code sent before then is ignored.
+- Every logout logged since Oct 10 was `from=bot-detection-anonymous` (6
+  episodes). The first five ended only with a code; the Oct 25-26 one
+  (23:33-01:24, no reply) cleared WITHOUT a code right after the host's WiFi
+  dropped and reconnected (01:17-01:22, probably a new public IP), on the same
+  profile. So it is not necessarily an expired session: the prompt says
+  "Indeed sign-in needed (bot check)" for that reason (`login.redirect_reason`)
+  and mentions the reconnect; other reasons keep "session expired".
 - The wait does not hold the other boards: the cycle closes without Indeed
   and the next cycles run LinkedIn/Wuzzuf/NaukriGulf on schedule while Indeed
   keeps its Chrome and waits. After the code the run ends `signed_in` (no

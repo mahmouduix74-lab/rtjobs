@@ -450,9 +450,34 @@ def main():
                     assert not result('degraded', 'degraded')[0], 'disabled boards never alert'
                 with db.get_db() as conn:
                     conn.execute("DELETE FROM runs WHERE source='linkedin'")
+            # The board's own alert for its latest run stands in for the monitor's
+            # first one (2026-10-26: every LinkedIn episode arrived twice); the
+            # reminders still follow. A board alert from an older run covers nothing.
+            with db.get_db() as conn:
+                conn.execute("DELETE FROM pipeline_alerts WHERE check_name='scrape_result_linkedin'")
+                conn.execute("INSERT INTO runs (source,status,started_at,finished_at) VALUES ('linkedin','degraded',?,?)",
+                             (stamp(3), stamp(2)))
+                conn.execute("INSERT OR REPLACE INTO scrape_health (source,check_name,failing,detail,first_seen_at,last_seen_at,"
+                             "last_alert_at) VALUES ('linkedin','window_complete',1,'short',?,?,?)", (stamp(9), stamp(2), stamp(2)))
+            check = {'scrape_result_linkedin': (True, 'degraded')}
+            with patch.object(telegram, 'notify_failure', return_value=True) as alert:
+                monitor.report_checks(check, now)
+                assert not alert.called, 'the board already alerted for its latest run'
+                monitor.report_checks(check, now + remind)
+                assert alert.call_count == 1 and 'still failing' in alert.call_args.args[0]
+                monitor.report_checks({'scrape_result_linkedin': (False, 'ok')}, now + remind)
+                with db.get_db() as conn:
+                    conn.execute("UPDATE scrape_health SET last_seen_at=? WHERE source='linkedin'", (stamp(10),))
+                monitor.report_checks(check, now + remind)
+                assert alert.call_count == 2 and alert.call_args.args[0] == 'Pipeline: scrape_result_linkedin'
+            with db.get_db() as conn:
+                conn.execute("DELETE FROM runs WHERE source='linkedin'")
+                conn.execute("DELETE FROM scrape_health WHERE source='linkedin'")
+                conn.execute("DELETE FROM pipeline_alerts WHERE check_name='scrape_result_linkedin'")
             client.close(); fresh.close()
             print('PASS monitor stale heartbeats, persistent alert episodes, failed-send retry, 3-hourly reminders, quiet-board check, '
-                  'scrape results confirmed twice (or 3 per hour), dry run and degraded heartbeat suppression')
+                  'scrape results confirmed twice (or 3 per hour) and not repeated after the board alert, dry run and '
+                  'degraded heartbeat suppression')
 
 
 if __name__ == '__main__':
