@@ -301,6 +301,27 @@ def verify(directory):
     # Telegram counts the limit after entity parsing (escapes removed).
     assert len(telegram._unescape_md(sent[0][0])) <= 4096 and len(sent[0][1]) <= 4096
     assert sent[0][1].startswith("🚨 Board crashed") and sent[0][1].endswith("🔧 hint")
+    # Every alert leaves one log line saying whether it was delivered.
+    for delivered, level in ((True, "info"), (False, "warning")):
+        with patch.object(telegram, "TELEGRAM_FAILURE_CHAT_ID", "-1002"), \
+                patch.object(telegram, "_send", return_value=delivered), patch.object(telegram.logger, level) as log:
+            assert telegram.notify_failure("Indeed login code missing", "d") is delivered
+        assert any("Indeed login code missing" in call.args for call in log.call_args_list), log.call_args_list
+    # Login prompts: channels reject ForceReply, so it is only tried where the
+    # chat type allows it (an unknown type tries, and a rejection falls back).
+    calls = []
+    def fake_api(method, payload, timeout=15):
+        calls.append((method, payload))
+        if method == "getChat":
+            return {"ok": True, "result": {"type": chat_type}} if chat_type else None
+        if "reply_markup" in payload and chat_type in ("channel", None):
+            return None
+        return {"ok": True, "result": {"message_id": 9}}
+    for chat_type, tries in (("channel", [False]), ("supergroup", [True]), (None, [True, False])):
+        calls.clear()
+        with patch.object(telegram, "_api", side_effect=fake_api):
+            assert telegram.send_login_prompt("-1002", "code?") == 9
+        assert ["reply_markup" in p for m, p in calls if m == "sendMessage"] == tries, (chat_type, calls)
     delivered = [r for r in db.get_unnotified(limit=100) if r["id"] == row["id"]]
     with patch.object(telegram, "_send", return_value=True) as send, patch.object(telegram.time, "sleep"):
         assert telegram.notify_jobs(delivered) == 1
@@ -738,6 +759,25 @@ def verify_reposts():
         assert indeed_login.ensure_logged_in(SyncBounce("https://eg.indeed.com/jobs?q="), {})
     with patch.object(indeed_login, "_cooldown_active", return_value=True):
         assert not indeed_login.ensure_logged_in(SyncBounce("https://secure.indeed.com/auth?from=x"), {})
+    # The code prompt names Indeed's redirect reason: a bot check (every logout
+    # since Oct 10; one cleared without a code on Oct 26) is not called expired.
+    bot_check = "https://secure.indeed.com/auth?hl=en_US&co=US&continue=x&from=bot-detection-anonymous"
+    assert indeed_login.redirect_reason(bot_check) == "bot-detection-anonymous"
+    assert indeed_login.redirect_reason("https://eg.indeed.com/jobs?q=") == ""
+    with patch.object(indeed_login, "_cooldown_active", return_value=False), \
+            patch.object(indeed_login, "_do_login", return_value=False) as do_login:
+        indeed_login.ensure_logged_in(SyncBounce(bot_check), {})
+    assert do_login.call_args.args[2] == "bot-detection-anonymous"
+    with patch.object(indeed_login.telegram, "latest_update_id", return_value=7), \
+            patch.object(indeed_login.telegram, "get_bot_username", return_value="bot"), \
+            patch.object(indeed_login.telegram, "send_login_prompt", return_value=42) as prompt:
+        assert indeed_login._alert_for_code("bot-detection-anonymous") == (7, 42)
+        assert "(bot check)" in prompt.call_args.args[1] and "may still be valid" in prompt.call_args.args[1]
+        indeed_login._alert_for_code("")
+        assert prompt.call_args.args[1].startswith("Indeed session expired — re-login needed\n\n")
+    indeed_login.clear_episode_flags()
+    next_at = indeed_login._next_attempt()
+    assert len(next_at) == 5 and next_at[2] == ":" and next_at.replace(":", "").isdigit(), next_at
     print("PASS reposts: fresh listing of a known ID recorded, re-sent after the cooldown (classified first), tagged; all boards report listing times")
 
 
@@ -1828,26 +1868,26 @@ def verify_browser_recovery():
         assert not spider.health.checks["window_complete"]["good"] and len(page.calls) == 3
         assert "29 of the 30" in spider.health.error and "pages served 25+5+0 cards, 1 repeated from an earlier page" \
             f" ({ids[24]})" in spider.health.error, spider.health.error
-        # No repeats, list ended, up to 3 short: LinkedIn counts jobs it does not
+        # No repeats, list ended, up to 5 short: LinkedIn counts jobs it does not
         # list yet. One relevance-order page looks for them; never an alert.
-        short = [(200, cards_body(ids[:25], total=30)), (200, cards_body(ids[25:29], total=30)), (200, cards_body([], total=30))]
-        page = LinkedInApiPage(short + [(200, cards_body(ids[:25], total=30))])
+        short = [(200, cards_body(ids[:25], total=34)), (200, cards_body(ids[25:29], total=34)), (200, cards_body([], total=34))]
+        page = LinkedInApiPage(short + [(200, cards_body(ids[:25], total=34))])
         spider, saved = await run(page, known=ids)
         assert spider.health.status == "ok" and spider.health.checks["window_complete"]["good"], spider.health.error
         assert len(page.calls) == 4 and "sortBy:List(DD)" in page.calls[0] and "sortBy:List(R)" in page.calls[3] \
             and "start=0" in page.calls[3] and not saved
-        page = LinkedInApiPage(short + [(200, cards_body([ids[29]] + ids[:10], total=30))], {ids[29]: (200, posting(ids[29]))})
+        page = LinkedInApiPage(short + [(200, cards_body([ids[29]] + ids[:10], total=34))], {ids[29]: (200, posting(ids[29]))})
         spider, saved = await run(page, known=ids[:29])
         assert spider.health.status == "ok" and [job["external_id"] for job in saved] == [ids[29]], spider.health.error
         page = LinkedInApiPage(short + [(429, "")])
         spider, saved = await run(page, known=ids)
         assert spider.health.status == "ok" and len(page.calls) == 4 and not saved, spider.health.error
         # One past the limit, or a repeat (above), is ours to explain: no probe, alert.
-        page = LinkedInApiPage([(200, cards_body(ids[:25], total=30)), (200, cards_body(ids[25:26], total=30)),
-                                (200, cards_body([], total=30))])
+        page = LinkedInApiPage([(200, cards_body(ids[:25], total=32)), (200, cards_body(ids[25:26], total=32)),
+                                (200, cards_body([], total=32))])
         spider, _ = await run(page, known=ids)
         assert not spider.health.checks["window_complete"]["good"] and len(page.calls) == 3
-        assert "26 of the 30" in spider.health.error and "pages served 25+1+0 cards, 0 repeated" in spider.health.error
+        assert "26 of the 32" in spider.health.error and "pages served 25+1+0 cards, 0 repeated" in spider.health.error
         odd = cards_body(ids[:2])
         odd["data"]["elements"].append({"jobCardUnion": {"*jobPostingCard": "urn:li:fsd_promotedCard:1"}})
         spider, _ = await run(LinkedInApiPage([(200, odd)]), known=ids)

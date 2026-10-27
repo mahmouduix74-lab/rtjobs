@@ -221,10 +221,14 @@ description, link, extra(dict), scraped_at`.
        page 1's tail) — never assume "page 1 = newest".
        `paging.total` can run AHEAD of the list (2026-10-24): a new job is counted
        minutes before its card is served, and one job counted for 2 h was never
-       served. A list that ended (short page) with no repeats and <= 3 short
+       served. A list that ended (short page) with no repeats and <= 5 short
        (`_COUNT_AHEAD_MAX`) is that: one page in relevance order (`sortBy:List(R)`,
        derived from cards_url) looks for the missing jobs (found ones are read as
        usual), logged, no alert. Repeats or bigger gaps still fail window_complete.
+       The limit was 3 until 2026-10-26: 930 windows Oct 24-26 were short by 1-4,
+       never 5+, and every 4 (busy hours, healed next run) alerted. A per-run
+       verdict deferred until later runs show the counted jobs (listed_ms) was
+       considered and declined for now (state across runs; user, 2026-10-26).
     b. Record per NEW id: `/voyager/api/jobs/jobPostings/<id>?decorationId=
        com.linkedin.voyager.deco.jobs.web.shared.WebFullJobPosting-65`: title,
        description.text, listedAt/originalListedAt, jobState, formattedLocation,
@@ -470,6 +474,13 @@ port and logins disabled — never the production profile directly.
   ok, or FLAP_FAILURES (3) runs within the hour were, and the latest is still bad.
   Before, ONE degraded run alerted whenever the monitor polled before the next run
   finished (10:51 LinkedIn window_complete 27 of 28, healed at 10:54, nothing lost).
+  (2026-10-26) When the board's own health alert already went out for a check that
+  failed in its latest run (`_board_alerted`: scrape_health failing, last_alert_at
+  set, last_seen_at >= that run's start), the monitor counts it as the episode's
+  alert without sending: every LinkedIn episode used to arrive twice. Reminders
+  still follow every 3 h; a board alert from an older run covers nothing.
+  Every `notify_failure` logs `[alert] Sent: <subject>` / `[alert] NOT delivered:`
+  in its process log (until 2026-10-26 a delivered alert left no trace).
   `board_quiet_<board>` (LinkedIn only, LINKEDIN_QUIET_ALERT_HOURS=6): runs ok
   (>= half the expected count) but no new job saved for 6 h — catches a search
   that silently returns nothing new (longest normal gap Sep 25-Oct 20: 3.2 h).
@@ -643,6 +654,12 @@ port and logins disabled — never the production profile directly.
   `production-a89c078-20261024-1639`, rollback `rollback-20261024-1639` = 65113da):
   LinkedIn count-ahead (no alert for <= 3 short, relevance probe), NaukriGulf
   ERR_NETWORK_CHANGED retry, dead-code cleanup, ruff in deploy.sh.
+- 2026-10-26 18:39 Cairo: main `afc7341` deployed (image
+  `production-afc7341-20261026-1837`, rollback `rollback-20261026-1837` = a89c078;
+  the USER ran deploy.sh: auto mode blocks Claude from production deploys):
+  LinkedIn count-ahead limit 5, monitor no longer repeats a board's alert
+  (reminders kept), `[alert] Sent:` log lines, Indeed bot-check prompt wording +
+  next-attempt time, no ForceReply attempt in channels.
 
 ## Immediate queue notifications
 - After committing a complete scrape cycle, notify `enrichment`; after committing
